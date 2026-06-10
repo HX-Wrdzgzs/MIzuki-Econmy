@@ -30,7 +30,6 @@ class EconomyManager:
                         expire_time DATETIME NOT NULL
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """)
-                # 建立 v50 报名池表
                 await cur.execute("""
                     CREATE TABLE IF NOT EXISTS economy_v50 (
                         user_id BIGINT PRIMARY KEY,
@@ -119,7 +118,55 @@ class EconomyManager:
                     await cur.execute("INSERT IGNORE INTO user_titles (user_id, title_name) VALUES (%s, %s)", (user_id, title))
         return lvl, xp, leveled_up
 
-    # ================= 疯狂星期四 v50 核心逻辑 =================
+    # ================= 决斗 PK =================
+    async def settle_pk(self, challenger_id: int, target_id: int, amount: int) -> dict:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await conn.begin()
+                    await cur.execute("SELECT user_id, user_name, balance FROM user_economy WHERE user_id IN (%s, %s) FOR UPDATE", (challenger_id, target_id))
+                    rows = await cur.fetchall()
+                    user_dict = {row[0]: {"name": row[1], "bal": row[2]} for row in rows}
+                    
+                    if challenger_id not in user_dict:
+                        await conn.rollback()
+                        return {"status": False, "msg": "❌ 发起方未注册经济系统。"}
+                    if target_id not in user_dict:
+                        await conn.rollback()
+                        return {"status": False, "msg": "❌ 被挑战方未注册经济系统。"}
+                        
+                    if user_dict[challenger_id]["bal"] < amount:
+                        await conn.rollback()
+                        return {"status": False, "msg": f"❌ 决斗取消：发起方 {user_dict[challenger_id]['name']} 余额不足 {amount} PC。"}
+                    if user_dict[target_id]["bal"] < amount:
+                        await conn.rollback()
+                        return {"status": False, "msg": f"❌ 决斗取消：被挑战方 {user_dict[target_id]['name']} 余额不足 {amount} PC。"}
+
+                    if random.random() < 0.5:
+                        winner_id, loser_id = challenger_id, target_id
+                    else:
+                        winner_id, loser_id = target_id, challenger_id
+                        
+                    tax = max(1, int(amount * 0.3))
+                    win_net = amount - tax
+                    
+                    await cur.execute("UPDATE user_economy SET balance = balance + %s WHERE user_id = %s", (win_net, winner_id))
+                    await cur.execute("UPDATE user_economy SET balance = balance - %s WHERE user_id = %s", (amount, loser_id))
+                    
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (winner_id, win_net, f"PK决斗战胜 {user_dict[loser_id]['name']}"))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (loser_id, -amount, f"PK决斗败给 {user_dict[winner_id]['name']}"))
+                    
+                    await conn.commit()
+                    return {
+                        "status": True,
+                        "winner_id": winner_id, "winner_name": user_dict[winner_id]["name"],
+                        "loser_id": loser_id, "loser_name": user_dict[loser_id]["name"],
+                        "win_net": win_net, "tax": tax
+                    }
+                except Exception as e:
+                    await conn.rollback(); raise e
+
+    # ================= 疯狂星期四 v50 =================
     async def join_v50_pool(self, user_id: int, user_name: str, group_id: int) -> dict:
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -273,7 +320,7 @@ class EconomyManager:
                 except Exception as e:
                     await conn.rollback(); raise e
 
-    # ================= 数据查询与商城 =================
+    # ================= 签到与信息 =================
     async def sign_in(self, user_id: int, user_name: str, luck: int, quote: str, good: str, bad: str):
         today = datetime.date.today()
         async with self.pool.acquire() as conn:
@@ -302,8 +349,9 @@ class EconomyManager:
                 return {"lvl": user_row[0], "xp": user_row[1], "bal": user_row[2], "sta": user_row[3], "title": user_row[4],
                         "prof": [user_row[5], user_row[6], user_row[7]], "reg_date": user_row[8], "theme": user_row[9], "logs": logs}
 
+    # ================= 商城与背包 =================
     async def buy_item(self, user_id: int, item_id: int):
-        if item_id not in ITEM_MAP: return {"status": False, "msg": "❌ 商品不存在。"}
+        if item_id not in ITEM_MAP: return {"status": False, "msg": "❌ 商品编号不存在，请核对网页商城。"}
         item = ITEM_MAP[item_id]
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -311,15 +359,16 @@ class EconomyManager:
                     await conn.begin()
                     await cur.execute("SELECT balance, level FROM user_economy WHERE user_id=%s FOR UPDATE", (user_id,))
                     row = await cur.fetchone()
-                    if not row: return {"status": False, "msg": "⚠️ 请先签到。"}
+                    if not row: return {"status": False, "msg": "⚠️ 尚未注册经济系统，请先签到。"}
                     bal, lvl = row
-                    if lvl < item["lv"]: return {"status": False, "msg": f"⚠️ 需要 Lv.{item['lv']}。"}
-                    if bal < item["price"]: return {"status": False, "msg": f"❌ 余额不足，需 {item['price']} PC。"}
+                    if lvl < item["lv"]: return {"status": False, "msg": f"⚠️ 等级不足，该商品需要 Lv.{item['lv']} 才能购买。"}
+                    if bal < item["price"]: return {"status": False, "msg": f"❌ PC 余额不足！需要 {item['price']} PC。"}
                     
                     await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (item["price"], user_id))
                     await cur.execute("INSERT INTO user_inventory (user_id, item_id, quantity) VALUES (%s, %s, 1) ON DUPLICATE KEY UPDATE quantity = quantity + 1", (user_id, item_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -item["price"], f"商城购买: {item['name']}"))
                     await conn.commit()
-                    return {"status": True, "msg": f"✅ 购买成功！获得了 [{item['name']}]。"}
+                    return {"status": True, "msg": f"✅ 提货成功！已扣除 {item['price']} PC，获得物资：[{item['name']}]。可前往【我的背包】查看。"}
                 except Exception as e:
                     await conn.rollback(); raise e
 
@@ -352,3 +401,61 @@ class EconomyManager:
                     return {"status": True, "msg": f"✨ 成功使用了 [{item['name']}]！"}
                 except Exception as e:
                     await conn.rollback(); raise e
+
+    # ================= 红包系统核心流转 =================
+    async def send_redpacket(self, user_id: int, total_amount: int, packet_id: str) -> tuple[bool, str]:
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await conn.begin()
+                    await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s FOR UPDATE", (user_id,))
+                    row = await cur.fetchone()
+                    if not row or row[0] < total_amount:
+                        await conn.rollback()
+                        return False, "❌ 余额不足！无法发出红包。"
+                    
+                    await cur.execute("UPDATE user_economy SET balance = balance - %s WHERE user_id=%s", (total_amount, user_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", 
+                                      (user_id, -total_amount, f"发出群红包[SN:{packet_id}]"))
+                    await conn.commit()
+                    return True, "Success"
+                except Exception as e:
+                    await conn.rollback(); raise e
+
+    async def grab_redpacket(self, user_id: int, user_name: str, grab_amount: int, packet_id: str, sender_name: str):
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await conn.begin()
+                    await cur.execute("INSERT IGNORE INTO user_economy (user_id, user_name) VALUES (%s, %s)", (user_id, user_name))
+                    await cur.execute("UPDATE user_economy SET balance = balance + %s WHERE user_id=%s", (grab_amount, user_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", 
+                                      (user_id, grab_amount, f"抢到{sender_name}的红包[SN:{packet_id}]"))
+                    await conn.commit()
+                except Exception as e:
+                    await conn.rollback(); raise e
+
+    # ================= 网页端 Web API 榜单数据支持 =================
+    async def get_leaderboard(self, limit: int = 100):
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT user_id, user_name, level, balance, active_title, DATE_FORMAT(created_at, '%%Y-%%m-%%d')
+                    FROM user_economy 
+                    ORDER BY balance DESC, level DESC 
+                    LIMIT %s
+                """, (limit,))
+                rows = await cur.fetchall()
+                
+                result = []
+                for idx, r in enumerate(rows):
+                    result.append({
+                        "rank": idx + 1,          
+                        "user_id": str(r[0]),     
+                        "name": r[1],             
+                        "level": r[2],            
+                        "score": r[3],            
+                        "title": r[4] if r[4] else "",  
+                        "join_date": r[5] if r[5] else "未知" 
+                    })
+                return result

@@ -4,6 +4,7 @@ import datetime
 import aiomysql
 import traceback
 import asyncio
+import string
 import time
 from nonebot import on_command, get_plugin_config, get_driver, logger, get_bots
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, Message, MessageSegment
@@ -19,7 +20,7 @@ from .const import QUOTES, FORTUNE_EVENTS, JOBS
 from maimai_sync.lib_msg import _sorted_markdown_segment
 
 from nonebot.plugin import PluginMetadata
-__plugin_meta__ = PluginMetadata(name="Mizuki Econmy", description="25时经济系统", usage="签到, 打工, 个人信息, pk, 发红包, 抢红包, v50报名, 经济帮助")
+__plugin_meta__ = PluginMetadata(name="Mizuki Econmy", description="25时经济系统", usage="签到, 打工, 个人信息, pk, 结算订单, 发红包, 抢红包, v50报名, 经济帮助")
 
 economy = None 
 plugin_config = get_plugin_config(Config)
@@ -64,11 +65,11 @@ async def init_db():
 async def safe_execute(matcher, func, *args, **kwargs):
     if not economy: await matcher.finish("⚠️ 数据库未连接。")
     try:
-        return await asyncio.wait_for(func(*args, **kwargs), timeout=10.0)
+        return await asyncio.wait_for(func(*args, **kwargs), timeout=45.0)
     except (FinishedException, RejectedException, PausedException):
         raise
     except asyncio.TimeoutError:
-        await matcher.finish("⚠️ 系统拥堵告警：底层响应超时。")
+        await matcher.finish("⚠️ 系统拥堵告警：底层响应超时(45s)，请稍后再试。")
     except Exception:
         err_msg = traceback.format_exc()
         await matcher.finish(f"❌ 内部执行崩溃：\n{err_msg[:150]}...")
@@ -133,7 +134,7 @@ async def global_broadcast(text: str, extra_btns: list):
         try:
             group_list = await bot.get_group_list()
             if str(bot_id) == OFFICIAL_BOT_ID:
-                msg = _sorted_markdown_segment(text, extra_btns)
+                msg = Message(_sorted_markdown_segment(text, extra_btns))
             else:
                 plain = text.replace("### ", "").replace("> ", "").replace("**", "").replace("<", "").replace(">", "")
                 msg = Message(plain)
@@ -159,7 +160,7 @@ async def handle_economy_help(bot: Bot, event: MessageEvent):
         "> 📊 **个人信息**：查看等级、资产与近期账单\n"
         "> 🎒 **我的背包**：查看已购买的道具存量\n\n"
         "### 🛒 消费与互动\n"
-        "> 🛒 **经济商城**：购买补给与专属外观 (指令: `购买 编号`)\n"
+        "> 🛒 **经济商城**：购买补给与外观 (指令: `结算订单 编号` 或 `购买 编号`)\n"
         "> ⚔️ **pk**：长按对方消息【回复】，或 `@某人 pk` (赌注 10~1000)\n"
         "> 🍗 **v50报名**：扣除 200 PC 押金参与周四大乐透\n"
         "> 🧧 **发红包/抢红包**：`发红包 金额 份数` (含 5% 税)\n\n"
@@ -169,10 +170,29 @@ async def handle_economy_help(bot: Bot, event: MessageEvent):
     )
     
     if str(bot.self_id) == OFFICIAL_BOT_ID:
-        await help_cmd.finish(_sorted_markdown_segment(text, ECONOMY_BUTTONS.copy()))
+        await help_cmd.finish(Message(_sorted_markdown_segment(text, ECONOMY_BUTTONS.copy())))
     else:
         plain = text.replace("### ", "").replace("> ", "").replace("**", "").replace("<", "").replace(">", "")
         await help_cmd.finish(plain)
+
+# ==================== 商城提货：结算订单 ====================
+buy_cmd = on_command("结算订单", aliases={"购买"}, priority=5, block=True)
+@buy_cmd.handle()
+async def handle_buy(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    item_id_str = args.extract_plain_text().strip()
+    if not item_id_str.isdigit():
+        await buy_cmd.finish("⚠️ 格式错误！请通过网页商城获取正确的提货指令，如：结算订单 101")
+        
+    async def _logic():
+        res = await economy.buy_item(event.user_id, int(item_id_str))
+        if str(bot.self_id) == OFFICIAL_BOT_ID:
+            prefix = "### ✅ 交易成功" if res['status'] else "### ❌ 交易失败"
+            msg = _sorted_markdown_segment(f"{prefix}\n> {res['msg']}", ECONOMY_BUTTONS.copy())
+            await buy_cmd.finish(Message(msg))
+        else:
+            await buy_cmd.finish(res['msg'])
+            
+    await safe_execute(buy_cmd, _logic)
 
 # ==================== 友人对战 (PK 系统) ====================
 pk_cmd = on_command("pk", aliases={"决斗", "对决"}, priority=5, block=True)
@@ -180,7 +200,7 @@ pk_cmd = on_command("pk", aliases={"决斗", "对决"}, priority=5, block=True)
 async def handle_pk(bot: Bot, event: MessageEvent):
     target_id = None
     
-    # 策略 1：引用回复检测（针对官方 Bot 防吞最稳妥方案）
+    # 策略 1：引用回复检测
     if event.reply:
         target_id = event.reply.sender.user_id
         
@@ -202,7 +222,6 @@ async def handle_pk(bot: Bot, event: MessageEvent):
     amount = random.randint(10, 1000)
     pending_pks[target_id] = {"challenger": event.user_id, "challenger_name": get_user_name(event), "amount": amount}
     
-    # 分流渲染决斗邀请
     if str(bot.self_id) == OFFICIAL_BOT_ID:
         txt = (
             f"### ⚔️ 生死决斗邀请 ⚔️\n"
@@ -243,7 +262,7 @@ async def handle_accept(bot: Bot, event: MessageEvent):
             f"> 📉 输家丢失了 **{pk_data['amount']} PC**"
         )
         if str(bot.self_id) == OFFICIAL_BOT_ID:
-            await accept_pk_cmd.finish(_sorted_markdown_segment(txt, ECONOMY_BUTTONS.copy()))
+            await accept_pk_cmd.finish(Message(_sorted_markdown_segment(txt, ECONOMY_BUTTONS.copy())))
         else:
             await accept_pk_cmd.finish(txt.replace("### ", "").replace("> ", "").replace("**", ""))
     await safe_execute(accept_pk_cmd, _logic)
@@ -270,7 +289,7 @@ async def handle_v50_join(bot: Bot, event: MessageEvent):
         
         if str(bot.self_id) == OFFICIAL_BOT_ID:
             msg = _sorted_markdown_segment(f"### 🍗 V50 报名\n> {res['msg']}", ECONOMY_BUTTONS.copy())
-            await v50_join_cmd.finish(msg)
+            await v50_join_cmd.finish(Message(msg))
         else:
             await v50_join_cmd.finish(res["msg"])
             
@@ -304,7 +323,7 @@ async def handle_sign(bot: Bot, event: MessageEvent):
         
         msg = Message(MessageSegment.image(img))
         if str(bot.self_id) == OFFICIAL_BOT_ID:
-            msg += _sorted_markdown_segment("### ✅ 签到成功", ECONOMY_BUTTONS.copy())
+            msg += Message(_sorted_markdown_segment("### ✅ 签到成功", ECONOMY_BUTTONS.copy()))
             
         await sign_cmd.finish(msg)
     await safe_execute(sign_cmd, _logic)
@@ -328,7 +347,7 @@ async def handle_info(bot: Bot, event: MessageEvent):
         
         msg = Message(MessageSegment.image(img))
         if str(bot.self_id) == OFFICIAL_BOT_ID:
-            msg += _sorted_markdown_segment("### 🔗 实时榜单: <https://list.mizuki.top>", ECONOMY_BUTTONS.copy())
+            msg += Message(_sorted_markdown_segment("### 🔗 实时榜单: <https://list.mizuki.top>", ECONOMY_BUTTONS.copy()))
         else:
             msg += Message("\n🔗 实时榜单: https://list.mizuki.top")
             
@@ -348,12 +367,12 @@ async def handle_work(bot: Bot, event: MessageEvent):
         
         msg = Message(MessageSegment.image(img))
         if str(bot.self_id) == OFFICIAL_BOT_ID:
-            msg += _sorted_markdown_segment("### 💼 打工结算完成", ECONOMY_BUTTONS.copy())
+            msg += Message(_sorted_markdown_segment("### 💼 打工结算完成", ECONOMY_BUTTONS.copy()))
             
         await work_cmd.finish(msg)
     await safe_execute(work_cmd, _logic)
 
-# ==================== 红包系统 (含 5% 手续费) ====================
+# ==================== 红包系统 (含账单流水验证) ====================
 send_re_cmd = on_command("发红包", priority=5, block=True)
 @send_re_cmd.handle()
 async def handle_send_re(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
@@ -370,14 +389,12 @@ async def handle_send_re(bot: Bot, event: GroupMessageEvent, args: Message = Com
     pool = total_amount - tax
     if pool < count: await send_re_cmd.finish(f"⚠️ 余额不足以分成这么多份。")
 
+    pkt_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
     async def _logic():
-        async with economy.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s", (user_id,))
-                row = await cur.fetchone()
-                if not row or row[0] < total_amount: await send_re_cmd.finish(f"❌ 余额不足！")
-                await cur.execute("UPDATE user_economy SET balance = balance - %s WHERE user_id=%s", (total_amount, user_id))
-                await conn.commit()
+        success, msg = await economy.send_redpacket(user_id, total_amount, pkt_id)
+        if not success:
+            await send_re_cmd.finish(msg)
 
         remain_amt, remain_cnt = pool, count
         parts_list = []
@@ -388,9 +405,14 @@ async def handle_send_re(bot: Bot, event: GroupMessageEvent, args: Message = Com
         parts_list.append(remain_amt); random.shuffle(parts_list)
 
         if group_id not in group_envelopes: group_envelopes[group_id] = []
-        group_envelopes[group_id].append({"id": f"{user_id}_{int(time.time())}", "sender_name": get_user_name(event), "parts": parts_list, "grabbed_by": set()})
+        group_envelopes[group_id].append({
+            "id": pkt_id, 
+            "sender_name": get_user_name(event), 
+            "parts": parts_list, 
+            "grabbed_by": set()
+        })
         
-        txt = f"### 🧧 {get_user_name(event)} 发送了红包！\n> 总额：{total_amount} PC (已扣税 {tax})\n> 快点击下方「抢红包」来瓜分吧！"
+        txt = f"### 🧧 {get_user_name(event)} 发出拼手气红包\n> 序列号：{pkt_id}\n> 总额：{total_amount} PC (扣税 {tax})\n> 快点击下方「抢红包」来瓜分吧！"
         if str(bot.self_id) == OFFICIAL_BOT_ID:
             await send_re_cmd.finish(Message(_sorted_markdown_segment(txt, [{"render_data.label": "抢红包", "action.data": "抢红包"}])))
         else:
@@ -408,16 +430,12 @@ async def handle_grab_re(bot: Bot, event: GroupMessageEvent):
     if not env["parts"]: await grab_re_cmd.finish("抢光了 😭")
 
     grab_amount = env["parts"].pop(0); env["grabbed_by"].add(user_id)
+    pkt_id = env["id"]
     if not env["parts"]: group_envelopes[group_id].remove(env)
 
     async def _logic():
-        async with economy.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("INSERT IGNORE INTO user_economy (user_id, user_name) VALUES (%s, %s)", (user_id, get_user_name(event)))
-                await cur.execute("UPDATE user_economy SET balance = balance + %s WHERE user_id=%s", (grab_amount, user_id))
-                await conn.commit()
-                
-        txt = f"### 🧧 恭喜！\n> 抢到了 {env['sender_name']} 的 {grab_amount} PC 💰"
+        await economy.grab_redpacket(user_id, get_user_name(event), grab_amount, pkt_id, env['sender_name'])
+        txt = f"### 🧧 抢红包成功！\n> 序列号：{pkt_id}\n> 抢到了 {env['sender_name']} 的 {grab_amount} PC 💰"
         if str(bot.self_id) == OFFICIAL_BOT_ID:
             await grab_re_cmd.finish(Message(_sorted_markdown_segment(txt, ECONOMY_BUTTONS.copy())))
         else:
@@ -435,7 +453,7 @@ async def handle_inventory(bot: Bot, event: MessageEvent):
         
         msg = Message(MessageSegment.image(img))
         if str(bot.self_id) == OFFICIAL_BOT_ID:
-            msg += _sorted_markdown_segment("### 🎒 背包查询完毕", ECONOMY_BUTTONS.copy())
+            msg += Message(_sorted_markdown_segment("### 🎒 背包查询完毕", ECONOMY_BUTTONS.copy()))
             
         await inventory_cmd.finish(msg)
     await safe_execute(inventory_cmd, _logic)
@@ -444,3 +462,35 @@ cancel_cmd = on_command("取消", aliases={"退出", "quit", "重置"}, priority
 @cancel_cmd.handle()
 async def _(bot: Bot, event: MessageEvent):
     await cancel_cmd.finish("✅ 已清理。")
+
+# ==================== 网页端 API 挂载 (排行榜) ====================
+try:
+    from nonebot import get_app
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
+
+    app = get_app()
+    
+    # 允许前端跨域
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"], 
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/economy/rank")
+    async def api_economy_rank():
+        if not economy:
+            return JSONResponse({"code": 500, "msg": "Database not connected", "data": []})
+        try:
+            data = await economy.get_leaderboard(100)
+            return JSONResponse({"code": 200, "msg": "success", "data": data})
+        except Exception as e:
+            logger.error(f"排行榜 API 请求失败: {e}")
+            return JSONResponse({"code": 500, "msg": str(e), "data": []})
+
+    logger.opt(colors=True).success("<g>[MizukiEconmy] 网页端经济榜 API 已成功挂载 -> GET /economy/rank</g>")
+except Exception as e:
+    logger.warning(f"[MizukiEconmy] Web API 挂载失败，这通常是因为当前驱动环境未启用 FastAPI: {e}")

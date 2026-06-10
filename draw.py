@@ -122,7 +122,6 @@ async def draw_sign_card(user_id, user_name, data):
     w_info = draw.textlength(info_txt, font=f_info)
     draw.text(((W-w_info)/2, 310), info_txt, font=f_info, fill=C_TEXT_SUB)
     
-    # 🌟 修复乱码方块：去除了 Emoji 符号
     pc_txt = f"签到奖励: +{data.get('pc_add', 0)} PC"
     w_pc = draw.textlength(pc_txt, font=f_pc)
     draw.rounded_rectangle([(W-w_pc)/2 - 30, 360, (W+w_pc)/2 + 30, 410], radius=25, fill="white", outline=C_PINK_MAIN, width=3)
@@ -272,7 +271,6 @@ async def draw_work_card(name, job_name, res: dict):
     # 左侧粉色装饰条
     draw.rectangle([0, 0, 30, H], fill=C_PINK_MAIN)
     
-    # 🌟 修复标题：针对一键打工进行更优雅的标题呈现
     if job_name in ["汇总", "一键"]:
         title_txt = "一键打工结算报告"
     else:
@@ -297,10 +295,15 @@ async def draw_work_card(name, job_name, res: dict):
         text_y += 45
         
     text_y += 15
+    
+    # 🌟 核心修复：根据正负号智能渲染收益字符串，防止出现 +-2 的情况
+    reward_val = res.get('reward', 0)
+    reward_str = f"+{reward_val}" if reward_val >= 0 else str(reward_val)
+    
     if res['status'] == "success":
-        draw.text((90, text_y), f"收益: +{res['reward']} PC   |   经验: +{res['xp_add']}", font=f_det, fill=C_GREEN)
+        draw.text((90, text_y), f"收益: {reward_str} PC   |   经验: +{res['xp_add']}", font=f_det, fill=C_GREEN)
     else:
-        draw.text((90, text_y), f"收益: {res['reward']} PC   |   经验: +{res['xp_add']}", font=f_det, fill=C_RED)
+        draw.text((90, text_y), f"收益: {reward_str} PC   |   经验: +{res['xp_add']}", font=f_det, fill=C_RED)
         
     text_y += 50
     cost_text = res.get('cost', '未知')
