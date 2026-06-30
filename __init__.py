@@ -21,7 +21,7 @@ from .config import Config
 from .model import EconomyManager
 from .draw import (draw_sign_card, draw_profile_card, draw_work_card, draw_shop_menu,
                    draw_inventory_card, draw_card_image, draw_gacha_result, download_card_image,
-                   draw_leaderboard_card, draw_achievement_card, draw_calendar_card)
+                   draw_leaderboard_card, draw_achievement_card, draw_calendar_card, draw_stock_chart, draw_card_collection)
 from .const import (QUOTES, FORTUNE_EVENTS, JOBS, PJSK_CARDS_URL, PJSK_CARD_IMAGE_BASE,
                     PJSK_PROXY_URL, RARITY_MAP, CHAR_MAP, STOCK_LIST, CROP_MAP, PET_MAP, MAP_AREAS,
                     QUIZ_BANK, RAID_BOSSES, DAILY_TASKS, ACHIEVEMENTS, SYNTHESIS_RULES, LOAN_CONFIG,
@@ -122,6 +122,44 @@ GACHA_BUTTONS = [
 
 STREAK_REWARDS = {3: 30, 7: 100, 14: 250, 30: 500}
 
+async def auto_reconnect_loop():
+    while True:
+        await asyncio.sleep(10800)
+        if economy and not economy.pool:
+            logger.info("Database pool is disconnected. Attempting to reconnect...")
+            try:
+                pool = await aiomysql.create_pool(
+                    host=plugin_config.sign_mysql_host,
+                    port=plugin_config.sign_mysql_port,
+                    user=plugin_config.sign_mysql_user,
+                    password=plugin_config.sign_mysql_password,
+                    db=plugin_config.sign_mysql_db,
+                    autocommit=True,
+                    minsize=3,
+                    maxsize=20,
+                    pool_recycle=3600
+                )
+                economy.pool = pool
+                await economy.init_tables()
+                await economy.init_cards_table()
+                logger.info("Successfully reconnected to MySQL database!")
+                try:
+                    await economy.sync_local_to_db()
+                    logger.info("Successfully synced local JSON database to MySQL.")
+                except Exception as sync_err:
+                    logger.error(f"Error syncing local database to MySQL: {sync_err}")
+            except Exception as e:
+                logger.error(f"Database reconnection failed: {e}")
+
+async def run_crawl_cards():
+    try:
+        from .crawl_cards import main as crawl_main
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, crawl_main)
+        logger.info("Card metadata and thumbnails successfully updated in background!")
+    except Exception as e:
+        logger.error(f"Error updating card thumbnails on startup: {e}")
+
 @get_driver().on_startup
 async def init_db():
     global economy
@@ -133,8 +171,11 @@ async def init_db():
         await economy.sync_local_to_db()
         asyncio.ensure_future(load_pjsk_cards())
     except Exception as e:
+        logger.warning(f"Database connection failed: {e}. Falling back to local mode.")
         economy = EconomyManager(None)
         asyncio.ensure_future(load_pjsk_cards())
+    asyncio.ensure_future(auto_reconnect_loop())
+    asyncio.ensure_future(run_crawl_cards())
 
 @get_driver().on_shutdown
 async def shutdown_db():
@@ -171,6 +212,8 @@ HELP_PAGES = {
             {"render_data.label": "个人信息", "action.data": "个人信息"},
             {"render_data.label": "打工", "action.data": "打工"},
             {"render_data.label": "排行榜", "action.data": "排行榜"},
+            {"render_data.label": "背包", "action.data": "背包"},
+            {"render_data.label": "使用", "action.data": "使用 "},
             {"render_data.label": "下一页", "action.data": "经济帮助 下一页 1"}
         ]
     },
@@ -181,6 +224,9 @@ HELP_PAGES = {
             {"render_data.label": "上一页", "action.data": "经济帮助 上一页 2"},
             {"render_data.label": "v50报名", "action.data": "v50报名"},
             {"render_data.label": "日记墙", "action.data": "日记墙"},
+            {"render_data.label": "发红包", "action.data": "发红包 "},
+            {"render_data.label": "抢红包", "action.data": "抢红包"},
+            {"render_data.label": "pk", "action.data": "pk "},
             {"render_data.label": "下一页", "action.data": "经济帮助 下一页 2"}
         ]
     },
@@ -191,6 +237,10 @@ HELP_PAGES = {
             {"render_data.label": "上一页", "action.data": "经济帮助 上一页 3"},
             {"render_data.label": "我的持仓", "action.data": "我的持仓"},
             {"render_data.label": "每日任务", "action.data": "每日任务"},
+            {"render_data.label": "股市", "action.data": "股市"},
+            {"render_data.label": "买入", "action.data": "买入 "},
+            {"render_data.label": "卖出", "action.data": "卖出 "},
+            {"render_data.label": "贷款", "action.data": "贷款 "},
             {"render_data.label": "下一页", "action.data": "经济帮助 下一页 3"}
         ]
     },
@@ -201,7 +251,11 @@ HELP_PAGES = {
             {"render_data.label": "上一页", "action.data": "经济帮助 上一页 4"},
             {"render_data.label": "我的卡牌", "action.data": "我的卡牌"},
             {"render_data.label": "单抽", "action.data": "单抽"},
-            {"render_data.label": "十连", "action.data": "十连"}
+            {"render_data.label": "十连", "action.data": "十连"},
+            {"render_data.label": "农场", "action.data": "农场"},
+            {"render_data.label": "收菜", "action.data": "收菜"},
+            {"render_data.label": "宠物", "action.data": "宠物"},
+            {"render_data.label": "副本", "action.data": "副本"}
         ]
     }
 }
@@ -283,7 +337,8 @@ async def handle_sign(bot: Bot, event: MessageEvent):
                     economy._write_local(data)
         except Exception:
             pass
-        img = await draw_sign_card(uid, uname, {"title": title, "luck": luck, "quote": qs, "good": evt["good"], "bad": evt["bad"], "lvl": lvl, "xp": xp, "pc_add": pc})
+        gid = event.group_id if hasattr(event, "group_id") else None
+        img = await draw_sign_card(uid, uname, {"title": title, "luck": luck, "quote": qs, "good": evt["good"], "bad": evt["bad"], "lvl": lvl, "xp": xp, "pc_add": pc}, bot, gid)
         msg = MessageSegment.image(img) + _econ_md("签到成功", ECONOMY_BUTTONS)
         await sign_cmd.finish(msg)
     await safe_execute(sign_cmd, _logic)
@@ -565,11 +620,16 @@ async def _(bot, event):
     async def _f():
         tasks = await economy.get_daily_tasks(event.user_id)
         txt = "今日任务\n"
+        buttons = []
         for t, done, claimed in tasks:
             st = "已领" if claimed else ("可领" if done else "未完成")
             txt += f"[{t['id']}] {t.get('name',t['id'])} - {st} (+{t.get('reward',50)}PC)\n"
+            if done and not claimed:
+                buttons.append({"render_data.label": f"领 {t.get('name')}", "action.data": f"领取奖励 {t['id']}"})
         txt += "\n发送 领取奖励 任务ID"
-        await daily_cmd.finish(txt)
+        buttons.append({"render_data.label": "每日任务", "action.data": "每日任务"})
+        buttons.append({"render_data.label": "个人信息", "action.data": "个人信息"})
+        await daily_cmd.finish(_econ_md(txt, buttons))
     await safe_execute(daily_cmd, _f)
 
 claim_cmd = on_command("领取奖励", priority=5, block=True)
@@ -579,7 +639,8 @@ async def _(bot, event, args=CommandArg()):
         tid = args.extract_plain_text().strip()
         if not tid:
             await claim_cmd.finish("格式: 领取奖励 任务ID")
-        await claim_cmd.finish(await economy.claim_task_reward(event.user_id, tid))
+        res_msg = await economy.claim_task_reward(event.user_id, tid)
+        await claim_cmd.finish(_econ_md(res_msg, [{"render_data.label": "每日任务", "action.data": "每日任务"}]))
     await safe_execute(claim_cmd, _f)
 
 ach_list_cmd = on_command("成就列表", aliases={"成就详情"}, priority=5, block=True)
@@ -707,24 +768,43 @@ async def _(bot, event, args=CommandArg()):
         await explore_cmd.finish(await economy.explore_area(event.user_id, int(t)))
     await safe_execute(explore_cmd, _f)
 
+STOCK_BUTTONS = [
+    {"render_data.label": "股市行情", "action.data": "股市"},
+    {"render_data.label": "我的持仓", "action.data": "我的持仓"},
+    {"render_data.label": "个人信息", "action.data": "个人信息"}
+]
+
 stock_cmd = on_command("股市", aliases={"股票"}, priority=5, block=True)
 @stock_cmd.handle()
 async def _(bot, event, args=CommandArg()):
     async def _f():
         from .const import STOCK_LIST
         t = args.extract_plain_text().strip()
-        if not t:
-            msg = "股市\n"
-            for s in STOCK_LIST:
-                msg += f"[{s['id']}] {s['name']} - {s['base_price']}PC/股\n"
-            msg += "\n买入: 股票 ID 数量 | 卖出: 卖出 ID 数量 | 持仓: 我的持仓"
-            await stock_cmd.finish(msg)
-        parts = t.split()
-        if len(parts) < 2 or not parts[1].isdigit():
-            await stock_cmd.finish("格式: 股票 ID 数量")
-        res = await economy.buy_stock(event.user_id, parts[0], int(parts[1]))
-        await stock_cmd.finish(res["msg"])
+        if t:
+            parts = t.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                res = await economy.buy_stock(event.user_id, parts[0], int(parts[1]))
+                await stock_cmd.finish(_econ_md(res["msg"], STOCK_BUTTONS))
+            else:
+                await stock_cmd.finish("格式: 股票 代码 数量 或 直接发送 买入 代码 数量")
+        
+        prices, event_desc = economy.get_stock_prices()
+        history = economy.get_stock_history()
+        img = await draw_stock_chart(STOCK_LIST, prices, history, event_desc)
+        msg = MessageSegment.image(img) + _econ_md(event_desc or "25时证券交易所", STOCK_BUTTONS)
+        await stock_cmd.finish(msg)
     await safe_execute(stock_cmd, _f)
+
+buy_stock_cmd = on_command("买入", priority=5, block=True)
+@buy_stock_cmd.handle()
+async def _(bot, event, args=CommandArg()):
+    async def _f():
+        parts = args.extract_plain_text().strip().split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await buy_stock_cmd.finish("格式: 买入 代码 数量")
+        res = await economy.buy_stock(event.user_id, parts[0], int(parts[1]))
+        await buy_stock_cmd.finish(_econ_md(res["msg"], STOCK_BUTTONS))
+    await safe_execute(buy_stock_cmd, _f)
 
 sell_cmd = on_command("卖出", aliases={"卖股票"}, priority=5, block=True)
 @sell_cmd.handle()
@@ -732,8 +812,9 @@ async def _(bot, event, args=CommandArg()):
     async def _f():
         parts = args.extract_plain_text().strip().split()
         if len(parts) < 2 or not parts[1].isdigit():
-            await sell_cmd.finish("格式: 卖出 ID 数量")
-        await sell_cmd.finish((await economy.sell_stock(event.user_id, parts[0], int(parts[1])))["msg"])
+            await sell_cmd.finish("格式: 卖出 代码 数量")
+        res = await economy.sell_stock(event.user_id, parts[0], int(parts[1]))
+        await sell_cmd.finish(_econ_md(res["msg"], STOCK_BUTTONS))
     await safe_execute(sell_cmd, _f)
 
 hold_cmd = on_command("我的持仓", aliases={"持仓"}, priority=5, block=True)
@@ -743,12 +824,15 @@ async def _(bot, event):
         from .const import STOCK_LIST
         holdings = await economy.get_holdings(event.user_id)
         if not holdings:
-            await hold_cmd.finish("没有持仓")
-        txt = "持仓\n"
+            await hold_cmd.finish(_econ_md("你目前没有任何持仓", STOCK_BUTTONS))
+        prices, _ = economy.get_stock_prices()
+        txt = "我的股票持仓\n"
         for sid, qty in holdings:
-            s = next((s for s in STOCK_LIST if s["id"] == sid), {"name": sid, "base_price": 0})
-            txt += f"{s['name']} x{qty} (值{s['base_price']*qty}PC)\n"
-        await hold_cmd.finish(txt)
+            s = next((s for s in STOCK_LIST if s["id"] == sid), {"name": sid})
+            cur_price = prices.get(sid, {}).get("price", 0)
+            val = cur_price * qty
+            txt += f"[{sid}] {s['name']} x{qty} (现值 {val} PC)\n"
+        await hold_cmd.finish(_econ_md(txt, STOCK_BUTTONS))
     await safe_execute(hold_cmd, _f)
 
 auction_cmd = on_command("拍卖", aliases={"拍卖行"}, priority=5, block=True)
@@ -839,19 +923,29 @@ async def _(bot, event):
         await calendar_cmd.finish(msg)
     await safe_execute(calendar_cmd, _f)
 
+DIARY_BUTTONS = [
+    {"render_data.label": "日记墙", "action.data": "日记墙"},
+    {"render_data.label": "个人信息", "action.data": "个人信息"}
+]
+
 wall_cmd = on_command("日记墙", aliases={"树洞墙"}, priority=5, block=True)
 @wall_cmd.handle()
 async def _(bot, event):
     async def _f():
         diaries = await economy.get_diaries(10)
         if not diaries:
-            await wall_cmd.finish("还没有日记")
+            await wall_cmd.finish(_econ_md("日记墙目前空空如也，快来写下你的第一篇日记吧！", DIARY_BUTTONS))
         txt = "日记墙\n"
-        for did, uid, content, likes, anon, created in diaries:
+        for d in diaries:
+            did = d.get("id")
+            uid = d.get("user_id")
+            content = d.get("content")
+            likes = d.get("likes", 0)
+            anon = d.get("is_anonymous", 0)
             author = "匿名" if anon else f"用户{uid}"
-            txt += f"#{did} ({author}) {likes}\n{content}\n\n"
-        txt += "发送 共鸣 日记ID 点赞"
-        await wall_cmd.finish(txt)
+            txt += f"#{did} ({author}) 共鸣数:{likes}\n{content}\n\n"
+        txt += "发送: 共鸣 [日记ID]"
+        await wall_cmd.finish(_econ_md(txt, DIARY_BUTTONS))
     await safe_execute(wall_cmd, _f)
 
 like_cmd = on_command("共鸣", priority=5, block=True)
@@ -1164,23 +1258,19 @@ mycards_cmd = on_command("我的卡牌", aliases={"卡牌", "卡牌图鉴"}, pri
 @mycards_cmd.handle()
 async def _(bot, event):
     async def _f():
-        if not economy:
-            await mycards_cmd.finish("数据库未连接")
         cards = await economy.get_user_cards(event.user_id)
         if not cards:
-            await mycards_cmd.finish("没有卡牌")
-        total = sum(q for _, q in cards)
-        unique = len(cards)
-        star_counts = {}
+            await mycards_cmd.finish(_econ_md("你目前还没有获得任何卡牌。发送 单抽 / 十连 开始抽取吧！", GACHA_BUTTONS))
+        cards_with_info = []
         for cid, qty in cards:
-            ci = pjsk_card_by_id.get(cid)
-            if ci:
-                s = ci["star"]
-                star_counts[s] = star_counts.get(s, 0) + qty
-        txt = f"我的卡牌\n共 {total} 张，{unique} 种\n\n"
-        for star in sorted(star_counts.keys(), reverse=True):
-            txt += f"{star}星: {star_counts[star]} 张\n"
-        await mycards_cmd.finish(_econ_md(txt, ECONOMY_BUTTONS))
+            cinfo = pjsk_card_by_id.get(cid)
+            if cinfo:
+                cards_with_info.append({"info": cinfo, "qty": qty})
+        if not cards_with_info:
+            await mycards_cmd.finish(_econ_md("你目前还没有获得任何卡牌。发送 单抽 / 十连 开始抽取吧！", GACHA_BUTTONS))
+        img = await draw_card_collection(get_user_name(event), cards_with_info)
+        msg = MessageSegment.image(img) + _econ_md("我的卡牌图鉴", GACHA_BUTTONS)
+        await mycards_cmd.finish(msg)
     await safe_execute(mycards_cmd, _f)
 
 change_theme = on_command("切换主题", priority=5, block=True)

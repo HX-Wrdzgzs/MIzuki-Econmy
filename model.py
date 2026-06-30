@@ -56,6 +56,11 @@ class EconomyManager:
 
     def _write_local(self, data):
         try:
+            today_str = datetime.date.today().isoformat()
+            if "economy_logs" in data and isinstance(data["economy_logs"], list):
+                for log in data["economy_logs"]:
+                    if isinstance(log, dict) and "date" not in log:
+                        log["date"] = today_str
             with open(self.local_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -184,7 +189,8 @@ class EconomyManager:
                     ("buff_tech_succ", "INT DEFAULT 0"), ("buff_no_injury", "INT DEFAULT 0"),
                     ("buff_exp_up", "INT DEFAULT 0"), ("buff_pc_up", "INT DEFAULT 0"),
                     ("buff_sta_half", "INT DEFAULT 0"),
-                    ("sign_streak", "INT DEFAULT 0")
+                    ("sign_streak", "INT DEFAULT 0"),
+                    ("last_quiz_date", "DATE NULL")
                 ]
                 for col_name, col_type in new_columns:
                     try:
@@ -837,6 +843,23 @@ class EconomyManager:
                 "win_net": win_net, "tax": tax
             }
 
+    def _check_task_completion(self, task_id, logs):
+        if task_id == "task_sign":
+            return any("签到" in desc for desc in logs)
+        elif task_id == "task_buy":
+            return any("购买" in desc or "商城" in desc or "买入" in desc or "结算" in desc for desc in logs)
+        elif task_id == "task_transfer":
+            return any("转账" in desc for desc in logs)
+        elif task_id == "task_draw":
+            return any("单抽" in desc or "十连" in desc or "PJSK" in desc or "抽卡" in desc for desc in logs)
+        elif task_id == "task_guess":
+            return any("下注" in desc or "中奖" in desc or "猜拳" in desc or "PK" in desc or "骰子" in desc or "幸运数字" in desc for desc in logs)
+        elif task_id == "task_loan":
+            return any("贷款" in desc for desc in logs)
+        elif task_id == "task_synthesize":
+            return any("合成" in desc for desc in logs)
+        return False
+
     async def get_daily_tasks(self, user_id):
         from .const import DAILY_TASKS
         today = datetime.date.today()
@@ -844,18 +867,106 @@ class EconomyManager:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("SELECT task_id, completed, claimed FROM daily_tasks WHERE user_id=%s AND task_date=%s", (user_id, today))
-                    existing = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+                    existing = {r[0]: [r[1], r[2]] for r in await cur.fetchall()}
                     if not existing:
                         tasks = random.sample(DAILY_TASKS, min(3, len(DAILY_TASKS)))
                         for t in tasks:
                             await cur.execute("INSERT IGNORE INTO daily_tasks (user_id, task_id, task_date) VALUES (%s,%s,%s)", (user_id, t["id"], today))
-                        return [(t, 0, 0) for t in tasks]
-                    return [(next((t for t in DAILY_TASKS if t["id"] == tid), {"id": tid, "name": tid, "reward": 0}), done, claimed) for tid, (done, claimed) in existing.items()]
+                        existing = {t["id"]: [0, 0] for t in tasks}
+                    await cur.execute("SELECT description FROM economy_logs WHERE user_id=%s AND DATE(created_at)=%s", (user_id, today))
+                    logs = [r[0] for r in await cur.fetchall()]
+                    res = []
+                    for tid, state in existing.items():
+                        done, claimed = state[0], state[1]
+                        if not done:
+                            if self._check_task_completion(tid, logs):
+                                done = 1
+                                await cur.execute("UPDATE daily_tasks SET completed=1 WHERE user_id=%s AND task_id=%s AND task_date=%s", (user_id, tid, today))
+                        task_item = next((t for t in DAILY_TASKS if t["id"] == tid), {"id": tid, "name": tid, "reward": 50})
+                        res.append((task_item, done, claimed))
+                    return res
         else:
-            return []
+            data = self._read_local()
+            today_str = today.isoformat()
+            dt_store = data.setdefault("daily_tasks", {})
+            user_key = str(user_id)
+            if user_key not in dt_store or dt_store[user_key].get("date") != today_str:
+                tasks = random.sample(DAILY_TASKS, min(3, len(DAILY_TASKS)))
+                dt_store[user_key] = {
+                    "date": today_str,
+                    "tasks": [{"id": t["id"], "completed": 0, "claimed": 0} for t in tasks]
+                }
+            user_tasks = dt_store[user_key]["tasks"]
+            user_logs = [log for log in data.setdefault("economy_logs", []) if log.get("user_id") == user_id and log.get("date") == today_str]
+            log_descs = [log.get("description", "") for log in user_logs]
+            res = []
+            updated = False
+            for ut in user_tasks:
+                tid = ut["id"]
+                done = ut["completed"]
+                claimed = ut["claimed"]
+                if not done:
+                    if self._check_task_completion(tid, log_descs):
+                        done = 1
+                        ut["completed"] = 1
+                        updated = True
+                task_item = next((t for t in DAILY_TASKS if t["id"] == tid), {"id": tid, "name": tid, "reward": 50})
+                res.append((task_item, done, claimed))
+            if updated:
+                self._write_local(data)
+            return res
 
     async def claim_task_reward(self, user_id, task_id):
-        return "本地暂不支持领取任务奖励"
+        from .const import DAILY_TASKS
+        today = datetime.date.today()
+        task_item = next((t for t in DAILY_TASKS if t["id"] == task_id), None)
+        if not task_item:
+            return "无效的任务ID"
+        reward = task_item.get("reward", 50)
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT completed, claimed FROM daily_tasks WHERE user_id=%s AND task_id=%s AND task_date=%s", (user_id, task_id, today))
+                    row = await cur.fetchone()
+                    if not row:
+                        return "今日没有该任务"
+                    if not row[0]:
+                        return "任务未完成"
+                    if row[1]:
+                        return "奖励已领取"
+                    await cur.execute("UPDATE daily_tasks SET claimed=1 WHERE user_id=%s AND task_id=%s AND task_date=%s", (user_id, task_id, today))
+                    await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (reward, user_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, reward, f"领取任务奖励: {task_item['name']}"))
+                    return f"奖励领取成功，获得 {reward} PC"
+        else:
+            data = self._read_local()
+            user_key = str(user_id)
+            if user_key not in data.setdefault("user_economy", {}):
+                return "请先签到"
+            dt_store = data.setdefault("daily_tasks", {})
+            if user_key not in dt_store or dt_store[user_key].get("date") != today.isoformat():
+                return "今日没有该任务"
+            user_tasks = dt_store[user_key]["tasks"]
+            target_ut = None
+            for ut in user_tasks:
+                if ut["id"] == task_id:
+                    target_ut = ut
+                    break
+            if not target_ut:
+                return "今日没有该任务"
+            if not target_ut["completed"]:
+                return "任务未完成"
+            if target_ut["claimed"]:
+                return "奖励已领取"
+            target_ut["claimed"] = 1
+            data["user_economy"][user_key]["balance"] += reward
+            data["economy_logs"].append({
+                "user_id": user_id,
+                "amount": reward,
+                "description": f"领取任务奖励: {task_item['name']}"
+            })
+            self._write_local(data)
+            return f"奖励领取成功，获得 {reward} PC"
 
     async def take_loan(self, user_id, amount):
         if amount < 100 or amount > 5000:
@@ -875,6 +986,20 @@ class EconomyManager:
             uid_str = str(user_id)
             if uid_str not in data["user_economy"]:
                 return {"ok": False, "msg": "请先签到"}
+            loans = data.setdefault("economy_loans", [])
+            active_loans = [l for l in loans if l["user_id"] == user_id and l["status"] == "active"]
+            if active_loans:
+                return {"ok": False, "msg": "你已有一笔未还贷款"}
+            import time
+            due_time = time.time() + 7 * 86400
+            new_loan = {
+                "id": len(loans) + 1,
+                "user_id": user_id,
+                "amount": amount,
+                "due_date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(due_time)),
+                "status": "active"
+            }
+            loans.append(new_loan)
             data["user_economy"][uid_str]["balance"] += amount
             data["economy_logs"].append({"user_id": user_id, "amount": amount, "description": "贷款"})
             self._write_local(data)
@@ -898,7 +1023,27 @@ class EconomyManager:
                     await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s,%s,%s)", (user_id, -repay, "还贷"))
                     return {"ok": True, "msg": "还贷成功"}
         else:
-            return {"ok": False, "msg": "本地暂不支持还贷"}
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str not in data["user_economy"]:
+                return {"ok": False, "msg": "请先签到"}
+            loans = data.setdefault("economy_loans", [])
+            active_loan = None
+            for l in loans:
+                if l["user_id"] == user_id and l["status"] == "active":
+                    active_loan = l
+                    break
+            if not active_loan:
+                return {"ok": False, "msg": "没有待还贷款"}
+            repay = int(active_loan["amount"] * 1.05)
+            bal = data["user_economy"][uid_str]["balance"]
+            if bal < repay:
+                return {"ok": False, "msg": f"余额不足，需要{repay}PC"}
+            data["user_economy"][uid_str]["balance"] -= repay
+            active_loan["status"] = "paid"
+            data["economy_logs"].append({"user_id": user_id, "amount": -repay, "description": "还贷"})
+            self._write_local(data)
+            return {"ok": True, "msg": "还贷成功"}
 
     async def send_redpacket(self, user_id: int, total_amount: int, packet_id: str) -> tuple[bool, str]:
         if self.pool:
@@ -981,14 +1126,142 @@ class EconomyManager:
                         await conn.rollback()
                         raise
         else:
-            return {"status": "failed", "msg": "本地暂不支持该功能"}
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str not in data.setdefault("user_economy", {}):
+                return {"status": "failed", "msg": "尚未注册经济系统，请先签到"}
+            if data["user_economy"][uid_str]["balance"] < 200:
+                return {"status": "failed", "msg": "押注不足，需要 200 PC"}
+            v50_list = data.setdefault("v50_pool", [])
+            if any(item["user_id"] == user_id for item in v50_list):
+                return {"status": "failed", "msg": "已经报名过了"}
+            data["user_economy"][uid_str]["balance"] -= 200
+            v50_list.append({"user_id": user_id, "user_name": user_name, "group_id": group_id})
+            data["economy_logs"].append({"user_id": user_id, "amount": -200, "description": "v50集资筹码"})
+            self._write_local(data)
+            return {"status": "success", "msg": "报名成功"}
 
     async def execute_v50_draw(self) -> dict:
-        return {"status": "empty"}
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT user_id, user_name, group_id FROM economy_v50")
+                    rows = await cur.fetchall()
+                    if not rows:
+                        return {"status": "empty"}
+                    winner = random.choice(rows)
+                    winner_id, winner_name, group_id = winner[0], winner[1], winner[2]
+                    total_reward = len(rows) * 200
+                    await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (total_reward, winner_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (winner_id, total_reward, "V50中奖"))
+                    await cur.execute("TRUNCATE TABLE economy_v50")
+                    return {"status": "success", "winner_id": winner_id, "winner_name": winner_name, "group_id": group_id, "reward": total_reward}
+        else:
+            data = self._read_local()
+            v50_list = data.setdefault("v50_pool", [])
+            if not v50_list:
+                return {"status": "empty"}
+            winner = random.choice(v50_list)
+            winner_id, winner_name, group_id = winner["user_id"], winner["user_name"], winner["group_id"]
+            total_reward = len(v50_list) * 200
+            uid_str = str(winner_id)
+            if uid_str in data.setdefault("user_economy", {}):
+                data["user_economy"][uid_str]["balance"] += total_reward
+            data["economy_logs"].append({"user_id": winner_id, "amount": total_reward, "description": "V50中奖"})
+            data["v50_pool"] = []
+            self._write_local(data)
+            return {"status": "success", "winner_id": winner_id, "winner_name": winner_name, "group_id": group_id, "reward": total_reward}
 
     async def get_achievements(self, user_id):
         from .const import ACHIEVEMENTS
-        return [(a, False) for a in ACHIEVEMENTS]
+        unlocked_ids = set()
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT achievement_id FROM user_achievements WHERE user_id=%s", (user_id,))
+                    unlocked_ids = {r[0] for r in await cur.fetchall()}
+        else:
+            data = self._read_local()
+            unlocked_ids = set(data.setdefault("user_achievements", {}).setdefault(str(user_id), []))
+
+        detail = await self.get_user_detail(user_id)
+        if not detail:
+            return [(a, False) for a in ACHIEVEMENTS]
+
+        user_cards = await self.get_user_cards(user_id)
+        unique_cards_count = len(user_cards)
+        max_card_star = 0
+        from .__init__ import pjsk_card_by_id
+        for cid, _ in user_cards:
+            cinfo = pjsk_card_by_id.get(cid)
+            if cinfo and cinfo.get("star", 0) > max_card_star:
+                max_card_star = cinfo["star"]
+
+        logs = []
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT description FROM economy_logs WHERE user_id=%s", (user_id,))
+                    logs = [r[0] for r in await cur.fetchall()]
+        else:
+            data = self._read_local()
+            logs = [log.get("description", "") for log in data.setdefault("economy_logs", []) if log.get("user_id") == user_id]
+
+        buy_count = sum(1 for d in logs if "购买" in d or "商城" in d)
+        syn_count = sum(1 for d in logs if "合成" in d)
+        raid_count = sum(1 for d in logs if "一键打工" in d)
+
+        newly_unlocked = []
+        for a in ACHIEVEMENTS:
+            aid = a["id"]
+            if aid in unlocked_ids:
+                continue
+            atype = a["type"]
+            target = a["target"]
+            ok = False
+            if atype == "sign_count":
+                ok = detail["sign_streak"] >= target
+            elif atype == "level":
+                ok = detail["lvl"] >= target
+            elif atype == "has_5star":
+                ok = max_card_star >= 5
+            elif atype == "unique_cards":
+                ok = unique_cards_count >= target
+            elif atype == "buy_count":
+                ok = buy_count >= target
+            elif atype == "balance":
+                ok = detail["bal"] >= target
+            elif atype == "syn_count":
+                ok = syn_count >= target
+            elif atype == "raid_count":
+                ok = raid_count >= target
+
+            if ok:
+                unlocked_ids.add(aid)
+                newly_unlocked.append(a)
+
+        if newly_unlocked:
+            total_reward = sum(a["reward"] for a in newly_unlocked)
+            if self.pool:
+                async with self.pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        for a in newly_unlocked:
+                            await cur.execute("INSERT IGNORE INTO user_achievements (user_id, achievement_id) VALUES (%s, %s)", (user_id, a["id"]))
+                        await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (total_reward, user_id))
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, total_reward, f"解锁成就获得奖励 {len(newly_unlocked)}个"))
+            else:
+                data = self._read_local()
+                user_key = str(user_id)
+                data.setdefault("user_achievements", {}).setdefault(user_key, []).extend([a["id"] for a in newly_unlocked])
+                data.setdefault("user_economy", {}).setdefault(user_key, {})["balance"] = data["user_economy"][user_key].get("balance", 0) + total_reward
+                data.setdefault("economy_logs", []).append({
+                    "user_id": user_id,
+                    "amount": total_reward,
+                    "description": f"解锁成就获得奖励 {len(newly_unlocked)}个"
+                })
+                self._write_local(data)
+
+        return [(a, a["id"] in unlocked_ids) for a in ACHIEVEMENTS]
 
     async def get_user_cards(self, user_id: int):
         if self.pool:
@@ -999,7 +1272,7 @@ class EconomyManager:
         else:
             data = self._read_local()
             res = []
-            for key, qty in data["user_cards"].items():
+            for key, qty in data.setdefault("user_cards", {}).items():
                 parts = key.split("_")
                 if len(parts) == 2 and int(parts[0]) == user_id:
                     res.append((int(parts[1]), qty))
@@ -1014,108 +1287,848 @@ class EconomyManager:
                     return row[0] if row else 0
         else:
             data = self._read_local()
-            return data["user_cards"].get(f"{user_id}_{card_id}", 0)
+            return data.setdefault("user_cards", {}).get(f"{user_id}_{card_id}", 0)
 
-    async def synthesize_cards(self, user_id, star):
-        if not self.pool:
-            return {"msg": "本地暂不支持卡牌合成"}
-        from .__init__ import pjsk_card_pool
-        target_ids = {c["id"] for c in pjsk_card_pool if c["star"] == star}
-        if not target_ids:
-            return {"msg": "没有找到该星级的卡牌池"}
-        async with self.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                try:
-                    await conn.begin()
-                    await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s FOR UPDATE", (user_id,))
-                    row = await cur.fetchone()
-                    if not row or row[0] < 100:
-                        await conn.rollback()
-                        return {"msg": "余额不足，需要 100 PC"}
-                    await cur.execute("SELECT card_id, quantity FROM user_cards WHERE user_id=%s FOR UPDATE", (user_id,))
-                    user_cards = await cur.fetchall()
-                    valid_owned = []
-                    for cid, qty in user_cards:
-                        if cid in target_ids:
-                            valid_owned.extend([cid] * qty)
-                    if len(valid_owned) < 3:
-                        await conn.rollback()
-                        return {"msg": f"你拥有的 {star} 星卡牌不足 3 张 (当前仅有 {len(valid_owned)} 张)"}
-                    to_consume = random.sample(valid_owned, 3)
-                    for cid in to_consume:
-                        await cur.execute("UPDATE user_cards SET quantity = quantity - 1 WHERE user_id=%s AND card_id=%s", (user_id, cid))
-                    await cur.execute("DELETE FROM user_cards WHERE user_id=%s AND quantity <= 0", (user_id,))
-                    next_star = star + 1
-                    reward_pool = [c["id"] for c in pjsk_card_pool if c["star"] == next_star]
-                    if not reward_pool:
-                        await conn.rollback()
-                        return {"msg": f"没有更高星级的卡牌可以合成"}
-                    new_card_id = random.choice(reward_pool)
+    async def add_card(self, user_id: int, card_id: int):
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
                     await cur.execute("""
                         INSERT INTO user_cards (user_id, card_id, quantity)
                         VALUES (%s, %s, 1)
                         ON DUPLICATE KEY UPDATE quantity = quantity + 1
-                    """, (user_id, new_card_id))
-                    await cur.execute("UPDATE user_economy SET balance = balance - 100 WHERE user_id=%s", (user_id,))
-                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, -100, '卡牌合成')", (user_id,))
-                    await conn.commit()
-                    new_card_info = next(c for c in pjsk_card_pool if c["id"] == new_card_id)
-                    return {"msg": f"合成成功！消耗 100 PC 和 3 张 {star} 星卡牌，获得了 {next_star} 星卡牌: [{new_card_info['title']}] {new_card_info['char_name']}"}
-                except Exception as e:
-                    await conn.rollback()
-                    return {"msg": f"合成失败: {str(e)}"}
+                    """, (user_id, card_id))
+        else:
+            data = self._read_local()
+            key = f"{user_id}_{card_id}"
+            uc = data.setdefault("user_cards", {})
+            uc[key] = uc.get(key, 0) + 1
+            self._write_local(data)
+
+    async def synthesize_cards(self, user_id, star):
+        from .__init__ import pjsk_card_pool
+        target_ids = {c["id"] for c in pjsk_card_pool if c["star"] == star}
+        if not target_ids:
+            return {"msg": "没有找到该星级的卡牌池"}
+        
+        user_cards = await self.get_user_cards(user_id)
+        valid_owned = []
+        for cid, qty in user_cards:
+            if cid in target_ids:
+                valid_owned.extend([cid] * qty)
+        if len(valid_owned) < 3:
+            return {"msg": f"你拥有的 {star} 星卡牌不足 3 张 (当前仅有 {len(valid_owned)} 张)"}
+
+        to_consume = random.sample(valid_owned, 3)
+        next_star = star + 1
+        reward_pool = [c["id"] for c in pjsk_card_pool if c["star"] == next_star]
+        if not reward_pool:
+            return {"msg": f"没有更高星级的卡牌可以合成"}
+        new_card_id = random.choice(reward_pool)
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    try:
+                        await conn.begin()
+                        await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s FOR UPDATE", (user_id,))
+                        row = await cur.fetchone()
+                        if not row or row[0] < 100:
+                            await conn.rollback()
+                            return {"msg": "余额不足，需要 100 PC"}
+                        for cid in to_consume:
+                            await cur.execute("UPDATE user_cards SET quantity = quantity - 1 WHERE user_id=%s AND card_id=%s", (user_id, cid))
+                        await cur.execute("DELETE FROM user_cards WHERE user_id=%s AND quantity <= 0", (user_id,))
+                        await cur.execute("""
+                            INSERT INTO user_cards (user_id, card_id, quantity)
+                            VALUES (%s, %s, 1)
+                            ON DUPLICATE KEY UPDATE quantity = quantity + 1
+                        """, (user_id, new_card_id))
+                        await cur.execute("UPDATE user_economy SET balance = balance - 100 WHERE user_id=%s", (user_id,))
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, -100, '卡牌合成')", (user_id,))
+                        await conn.commit()
+                    except Exception as e:
+                        await conn.rollback()
+                        return {"msg": f"合成失败: {str(e)}"}
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str not in data.setdefault("user_economy", {}):
+                return {"msg": "请先签到"}
+            if data["user_economy"][uid_str]["balance"] < 100:
+                return {"msg": "余额不足，需要 100 PC"}
+            uc = data.setdefault("user_cards", {})
+            for cid in to_consume:
+                key = f"{user_id}_{cid}"
+                if key in uc:
+                    uc[key] -= 1
+                    if uc[key] <= 0:
+                        del uc[key]
+            new_key = f"{user_id}_{new_card_id}"
+            uc[new_key] = uc.get(new_key, 0) + 1
+            data["user_economy"][uid_str]["balance"] -= 100
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -100, "description": "卡牌合成"
+            })
+            self._write_local(data)
+
+        new_card_info = next(c for c in pjsk_card_pool if c["id"] == new_card_id)
+        return {"msg": f"合成成功！消耗 100 PC 和 3 张 {star} 星卡牌，获得了 {next_star} 星卡牌: [{new_card_info['title']}] {new_card_info['char_name']}"}
 
     async def get_farm(self, user_id):
-        return []
+        import time
+        from .const import CROP_MAP
+        now = time.time()
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, crop_id, planted_at, status FROM farm_plots WHERE user_id=%s", (user_id,))
+                    rows = await cur.fetchall()
+                    res = []
+                    for rid, cid, planted, st in rows:
+                        cinfo = CROP_MAP.get(cid, {"name": cid, "grow_hours": 2, "harvest": 30})
+                        planted_ts = time.mktime(planted.timetuple())
+                        elapsed = (now - planted_ts) / 3600.0
+                        grow_hours = cinfo["grow_hours"]
+                        if st == "growing" and elapsed >= grow_hours:
+                            st = "mature"
+                        mins_left = max(0, int((grow_hours - elapsed) * 60)) if st == "growing" else 0
+                        res.append({
+                            "id": rid,
+                            "crop_id": cid,
+                            "crop_name": cinfo["name"],
+                            "status": st,
+                            "minutes_left": mins_left
+                        })
+                    return res
+        else:
+            data = self._read_local()
+            plots = data.setdefault("farm_plots", [])
+            res = []
+            for plot in plots:
+                if plot["user_id"] == user_id:
+                    cid = plot["crop_id"]
+                    cinfo = CROP_MAP.get(cid, {"name": cid, "grow_hours": 2, "harvest": 30})
+                    elapsed = (now - plot["planted_at"]) / 3600.0
+                    st = plot["status"]
+                    grow_hours = cinfo["grow_hours"]
+                    if st == "growing" and elapsed >= grow_hours:
+                        st = "mature"
+                    mins_left = max(0, int((grow_hours - elapsed) * 60)) if st == "growing" else 0
+                    res.append({
+                        "id": plot["id"],
+                        "crop_id": cid,
+                        "crop_name": cinfo["name"],
+                        "status": st,
+                        "minutes_left": mins_left
+                    })
+            return res
 
     async def plant_crop(self, user_id, crop_id):
-        return "本地暂不支持该功能"
+        import time
+        from .const import CROP_MAP
+        cinfo = CROP_MAP.get(crop_id)
+        if not cinfo:
+            return "无效的作物ID"
+        cost = cinfo["seed_cost"]
+        plots = await self.get_farm(user_id)
+        if len(plots) >= 3:
+            return "你的农场已满，请先收菜"
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s", (user_id,))
+                    row = await cur.fetchone()
+                    if not row or row[0] < cost:
+                        return f"余额不足，种子需要 {cost} PC"
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (cost, user_id))
+                    await cur.execute("INSERT INTO farm_plots (user_id, crop_id, planted_at, status) VALUES (%s, %s, NOW(), 'growing')", (user_id, crop_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -cost, f"播种: {cinfo['name']}"))
+                    return f"成功种植 {cinfo['name']}，消耗 {cost} PC"
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str not in data.setdefault("user_economy", {}):
+                return "请先签到"
+            bal = data["user_economy"][uid_str]["balance"]
+            if bal < cost:
+                return f"余额不足，种子需要 {cost} PC"
+            data["user_economy"][uid_str]["balance"] -= cost
+            plots = data.setdefault("farm_plots", [])
+            new_id = max([p["id"] for p in plots], default=0) + 1
+            plots.append({
+                "id": new_id,
+                "user_id": user_id,
+                "crop_id": crop_id,
+                "planted_at": time.time(),
+                "status": "growing"
+            })
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -cost, "description": f"播种: {cinfo['name']}"
+            })
+            self._write_local(data)
+            return f"成功种植 {cinfo['name']}，消耗 {cost} PC"
 
     async def harvest_crops(self, user_id):
-        return "没有成熟的作物"
+        import time
+        from .const import CROP_MAP
+        plots = await self.get_farm(user_id)
+        mature = [p for p in plots if p["status"] == "mature"]
+        if not mature:
+            return "农场中目前没有可成熟收获的作物"
+        total_payout = 0
+        crop_names = []
+        for p in mature:
+            cinfo = CROP_MAP.get(p["crop_id"], {"harvest": 30, "name": p["crop_id"]})
+            total_payout += cinfo["harvest"]
+            crop_names.append(cinfo["name"])
+        mature_ids = [p["id"] for p in mature]
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    for rid in mature_ids:
+                        await cur.execute("DELETE FROM farm_plots WHERE id=%s", (rid,))
+                    await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (total_payout, user_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, total_payout, f"收获农作物: {', '.join(crop_names)}"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str in data.setdefault("user_economy", {}):
+                data["user_economy"][uid_str]["balance"] += total_payout
+            data["farm_plots"] = [p for p in data.setdefault("farm_plots", []) if p["id"] not in mature_ids]
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": total_payout, "description": f"收获农作物: {', '.join(crop_names)}"
+            })
+            self._write_local(data)
+        return f"收菜成功！获得了 {total_payout} PC 币从以下作物中: {', '.join(crop_names)}"
 
     async def adopt_pet(self, user_id, pet_type):
-        return "本地暂不支持该功能"
+        from .const import PET_MAP
+        pinfo = PET_MAP.get(pet_type)
+        if not pinfo:
+            return "无效的宠物类型"
+        cost = pinfo["base_cost"]
+        current_pet = await self.get_pet(user_id)
+        if current_pet:
+            return f"你已经领养了宠物 [{current_pet['pet_name']}] ({current_pet['pet_type_name']})"
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT balance FROM user_economy WHERE user_id=%s", (user_id,))
+                    row = await cur.fetchone()
+                    if not row or row[0] < cost:
+                        return f"余额不足，领养费需要 {cost} PC"
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (cost, user_id))
+                    await cur.execute("INSERT INTO user_pets (user_id, pet_type, pet_name, hunger, happiness, level) VALUES (%s, %s, %s, 50, 50, 1)", (user_id, pet_type, pinfo["name"]))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -cost, f"领养宠物: {pinfo['name']}"))
+                    return f"成功领养宠物 {pinfo['name']}，起名叫作「{pinfo['name']}」，消耗 {cost} PC"
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            if uid_str not in data.setdefault("user_economy", {}):
+                return "请先签到"
+            bal = data["user_economy"][uid_str]["balance"]
+            if bal < cost:
+                return f"余额不足，领养费需要 {cost} PC"
+            data["user_economy"][uid_str]["balance"] -= cost
+            pets = data.setdefault("user_pets", {})
+            pets[uid_str] = {
+                "pet_type": pet_type,
+                "pet_name": pinfo["name"],
+                "hunger": 50,
+                "happiness": 50,
+                "level": 1
+            }
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -cost, "description": f"领养宠物: {pinfo['name']}"
+            })
+            self._write_local(data)
+            return f"成功领养宠物 {pinfo['name']}，起名叫作「{pinfo['name']}」，消耗 {cost} PC"
 
     async def feed_pet(self, user_id):
-        return "本地暂不支持该功能"
+        current_pet = await self.get_pet(user_id)
+        if not current_pet:
+            return "你还没有宠物，发送 领养宠物 编号 开始"
+        cost = 20
+        detail = await self.get_user_detail(user_id)
+        if detail["bal"] < cost:
+            return f"余额不足，宠物饲料需要 {cost} PC"
+
+        level_up = False
+        if random.random() < 0.2:
+            level_up = True
+
+        new_hunger = min(100, current_pet["hunger"] + 15)
+        new_happiness = min(100, current_pet["happiness"] + 10)
+        new_level = current_pet["level"] + 1 if level_up else current_pet["level"]
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (cost, user_id))
+                    await cur.execute("UPDATE user_pets SET hunger=%s, happiness=%s, level=%s WHERE user_id=%s", (new_hunger, new_happiness, new_level, user_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -cost, f"喂食宠物: {current_pet['pet_name']}"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] -= cost
+            pet = data["user_pets"][uid_str]
+            pet["hunger"] = new_hunger
+            pet["happiness"] = new_happiness
+            pet["level"] = new_level
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -cost, "description": f"喂食宠物: {current_pet['pet_name']}"
+            })
+            self._write_local(data)
+
+        msg = f"你喂食了 {current_pet['pet_name']} (饱食度+{15}, 好感度+{10})，消耗 20 PC。"
+        if level_up:
+            msg += f" 恭喜！你的宠物升级到了 Lv.{new_level}！"
+        return msg
 
     async def get_pet(self, user_id):
-        return None
+        from .const import PET_MAP
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT pet_type, pet_name, hunger, happiness, level FROM user_pets WHERE user_id=%s", (user_id,))
+                    row = await cur.fetchone()
+                    if row:
+                        pinfo = PET_MAP.get(row[0], {"name": row[0]})
+                        return {
+                            "pet_type": row[0],
+                            "pet_type_name": pinfo["name"],
+                            "pet_name": row[1] if row[1] else pinfo["name"],
+                            "hunger": row[2],
+                            "happiness": row[3],
+                            "level": row[4]
+                        }
+                    return None
+        else:
+            data = self._read_local()
+            pet = data.setdefault("user_pets", {}).get(str(user_id))
+            if pet:
+                pinfo = PET_MAP.get(pet["pet_type"], {"name": pet["pet_type"]})
+                return {
+                    "pet_type": pet["pet_type"],
+                    "pet_type_name": pinfo["name"],
+                    "pet_name": pet["pet_name"] if pet["pet_name"] else pinfo["name"],
+                    "hunger": pet["hunger"],
+                    "happiness": pet["happiness"],
+                    "level": pet["level"]
+                }
+            return None
 
     async def join_raid(self, user_id, boss_id):
-        return "本地暂不支持该功能"
+        from .const import RAID_BOSSES
+        boss = next((b for b in RAID_BOSSES if b["id"] == boss_id), None)
+        if not boss:
+            return "无效的BossID"
+        cost = boss["cost"]
+        detail = await self.get_user_detail(user_id)
+        if detail["bal"] < cost:
+            return f"余额不足，挑战副本需要 {cost} PC"
+
+        import time
+        today_str = datetime.date.today().isoformat()
+        total_dmg = 0
+        participants = []
+        already_joined = False
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT SUM(damage) FROM raid_participants WHERE raid_id=%s AND DATE(created_at)=%s", (boss_id, today_str))
+                    r_sum = await cur.fetchone()
+                    total_dmg = r_sum[0] if r_sum[0] else 0
+                    if total_dmg >= boss["hp"]:
+                        return f"今日该副本Boss [{boss['name']}] 已被成功击杀！"
+                    await cur.execute("SELECT COUNT(*) FROM raid_participants WHERE raid_id=%s AND user_id=%s AND DATE(created_at)=%s", (boss_id, user_id, today_str))
+                    already_joined = (await cur.fetchone())[0] > 0
+        else:
+            data = self._read_local()
+            parts = data.setdefault("raid_participants", [])
+            active_parts = [p for p in parts if p["raid_id"] == boss_id and p.get("date") == today_str]
+            total_dmg = sum(p["damage"] for p in active_parts)
+            if total_dmg >= boss["hp"]:
+                return f"今日该副本Boss [{boss['name']}] 已被成功击杀！"
+            already_joined = any(p["user_id"] == user_id for p in active_parts)
+
+        if already_joined:
+            return "你今天已经参与过挑战该副本了"
+
+        dmg = random.randint(boss["min_damage"], boss["max_damage"])
+        new_total = total_dmg + dmg
+        defeated = new_total >= boss["hp"]
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (cost, user_id))
+                    await cur.execute("INSERT INTO raid_participants (raid_id, user_id, damage) VALUES (%s, %s, %s)", (boss_id, user_id, dmg))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -cost, f"挑战副本: {boss['name']}"))
+                    if defeated:
+                        await cur.execute("SELECT user_id, SUM(damage) FROM raid_participants WHERE raid_id=%s AND DATE(created_at)=%s GROUP BY user_id", (boss_id, today_str))
+                        all_p = await cur.fetchall()
+                        for p_uid, p_dmg in all_p:
+                            reward = int(boss["reward_pool"] * (p_dmg / new_total))
+                            await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (reward, p_uid))
+                            await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (p_uid, reward, f"击杀副本 [{boss['name']}] 奖励分配"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] -= cost
+            parts = data.setdefault("raid_participants", [])
+            new_id = max([p["id"] for p in parts], default=0) + 1
+            parts.append({
+                "id": new_id,
+                "raid_id": boss_id,
+                "user_id": user_id,
+                "damage": dmg,
+                "date": today_str
+            })
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -cost, "description": f"挑战副本: {boss['name']}"
+            })
+            if defeated:
+                active_parts = [p for p in parts if p["raid_id"] == boss_id and p.get("date") == today_str]
+                p_damages = {}
+                for p in active_parts:
+                    p_damages[p["user_id"]] = p_damages.get(p["user_id"], 0) + p["damage"]
+                for p_uid, p_dmg in p_damages.items():
+                    reward = int(boss["reward_pool"] * (p_dmg / new_total))
+                    pu_key = str(p_uid)
+                    if pu_key in data["user_economy"]:
+                        data["user_economy"][pu_key]["balance"] += reward
+                    data["economy_logs"].append({
+                        "user_id": p_uid, "amount": reward, "description": f"击杀副本 [{boss['name']}] 奖励分配"
+                    })
+            self._write_local(data)
+
+        if defeated:
+            return f"你挑战 {boss['name']} 造成了 {dmg} 点伤害！Boss已被击破，参与挑战的所有群友已按伤害比例平分了 {boss['reward_pool']} PC 币！"
+        return f"你挑战 {boss['name']} 造成了 {dmg} 点伤害！Boss剩余生命值: {boss['hp'] - new_total}。"
 
     async def get_quiz(self, user_id):
         from .const import QUIZ_BANK
-        return QUIZ_BANK[0]
+        today_str = datetime.date.today().isoformat()
+        date_hash = int(today_str.replace("-", ""))
+        idx = (user_id + date_hash) % len(QUIZ_BANK)
+        return QUIZ_BANK[idx]
 
     async def answer_quiz(self, user_id, answer):
-        return "本地暂不支持该功能"
+        today = datetime.date.today()
+        detail = await self.get_user_detail(user_id)
+        if not detail:
+            return "请先签到"
+        
+        last_quiz = detail.get("last_quiz_date")
+        if last_quiz and str(last_quiz) == today.isoformat():
+            return "你今天已经参与过每日问答了，明天再来吧"
+
+        quiz = await self.get_quiz(user_id)
+        correct = quiz["a"].strip().lower()
+        ans = answer.strip().lower()
+
+        is_correct = (ans == correct)
+        reward = 100 if is_correct else 0
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET last_quiz_date=%s WHERE user_id=%s", (today, user_id))
+                    if is_correct:
+                        await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (reward, user_id))
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, reward, "每日问答正确"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["last_quiz_date"] = today.isoformat()
+            if is_correct:
+                data["user_economy"][uid_str]["balance"] += reward
+                data.setdefault("economy_logs", []).append({
+                    "user_id": user_id, "amount": reward, "description": "每日问答正确"
+                })
+            self._write_local(data)
+
+        if is_correct:
+            return f"回答正确！恭喜获得 {reward} PC 币奖励！"
+        return f"回答错误！正确答案是:「{quiz['a']}」。明天继续加油！"
 
     async def explore_area(self, user_id, area_id):
-        return "本地暂不支持该功能"
+        from .const import MAP_AREAS
+        area = next((a for a in MAP_AREAS if a["id"] == area_id), None)
+        if not area:
+            return "无效的探索区域ID"
+        cost = area["cost"]
+        detail = await self.get_user_detail(user_id)
+        if detail["bal"] < cost:
+            return f"余额不足，前往 [{area['name']}] 需要过路费 {cost} PC"
+
+        success = random.random() < 0.85
+        reward = area["reward_pc"] if success else 0
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (cost, user_id))
+                    if success:
+                        await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (reward, user_id))
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, reward - cost, f"探索地图: {area['name']} (成功)"))
+                    else:
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -cost, f"探索地图: {area['name']} (迷路)"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] -= cost
+            if success:
+                data["user_economy"][uid_str]["balance"] += reward
+                data.setdefault("economy_logs", []).append({
+                    "user_id": user_id, "amount": reward - cost, "description": f"探索地图: {area['name']} (成功)"
+                })
+            else:
+                data.setdefault("economy_logs", []).append({
+                    "user_id": user_id, "amount": -cost, "description": f"探索地图: {area['name']} (迷路)"
+                })
+            self._write_local(data)
+
+        if success:
+            return f"你进入了 [{area['name']}] 并成功完成了探索，获得 {reward} PC 币！ (净赚 {reward - cost} PC)"
+        return f"你在 [{area['name']}] 探索途中迷路了，不仅没有任何收获，还白白损失了 {cost} PC 币。"
+
+    def get_stock_history_and_prices(self, today=None):
+        from .const import STOCK_LIST
+        if today is None:
+            today = datetime.date.today()
+        start_date = datetime.date(2026, 6, 1)
+        
+        prices_at_date = {s["id"]: s["base_price"] for s in STOCK_LIST}
+        history = {s["id"]: [] for s in STOCK_LIST}
+        
+        history_days = [(today - datetime.timedelta(days=i)) for i in range(6, -1, -1)]
+        history_days_ord = {d.toordinal() for d in history_days}
+        
+        today_ordinal = today.toordinal()
+        event_desc = ""
+        
+        for ord_val in range(start_date.toordinal(), today_ordinal + 1):
+            date_val = datetime.date.fromordinal(ord_val)
+            day_seed = ord_val
+            event_seed = day_seed * 37
+            
+            random.seed(event_seed)
+            has_event = random.random() < 0.1
+            event_stock_id = None
+            event_multiplier = 1.0
+            day_event_desc = ""
+            
+            if has_event:
+                event_stock = random.choice(STOCK_LIST)
+                event_stock_id = event_stock["id"]
+                is_surge = random.random() < 0.5
+                if is_surge:
+                    event_multiplier = 1.5 + random.uniform(0.1, 0.3)
+                    day_event_desc = f"【交易所简报】{event_stock['name']} 联动新曲大受好评，股价疯狂暴涨！"
+                else:
+                    event_multiplier = 0.35 + random.uniform(0.0, 0.1)
+                    day_event_desc = f"【交易所简报】{event_stock['name']} 宣布物料延期交付，股价跌跌不休！"
+            
+            if ord_val == today_ordinal:
+                event_desc = day_event_desc
+                
+            for s in STOCK_LIST:
+                sid = s["id"]
+                random.seed(day_seed + hash(sid))
+                change_pct = random.uniform(-0.08, 0.09)
+                if sid == event_stock_id:
+                    if event_multiplier > 1.0:
+                        change_pct = max(change_pct, 0.05) * event_multiplier
+                    else:
+                        change_pct = min(change_pct, -0.05) * (1.0 - event_multiplier)
+                
+                prev_price = prices_at_date[sid]
+                new_price = int(prev_price * (1.0 + change_pct))
+                new_price = max(10, new_price)
+                prices_at_date[sid] = new_price
+                
+                if ord_val in history_days_ord:
+                    date_str = date_val.strftime("%m-%d")
+                    history[sid].append((date_str, new_price))
+                    
+        prices_result = {}
+        for s in STOCK_LIST:
+            sid = s["id"]
+            cur_price = prices_at_date[sid]
+            hist = history[sid]
+            yesterday_price = hist[-2][1] if len(hist) >= 2 else s["base_price"]
+            change_rate = int((cur_price - yesterday_price) / yesterday_price * 100)
+            prices_result[sid] = {"price": cur_price, "change": change_rate}
+            
+        return prices_result, history, event_desc
+
+    def get_stock_prices(self):
+        prices, _, event_desc = self.get_stock_history_and_prices()
+        return prices, event_desc
+
+    def get_stock_history(self, days=7):
+        _, history, _ = self.get_stock_history_and_prices()
+        return history
+
 
     async def buy_stock(self, user_id, stock_id, qty):
-        return {"ok": False, "msg": "本地暂不支持该功能"}
+        from .const import STOCK_LIST
+        stock = next((s for s in STOCK_LIST if s["id"] == stock_id), None)
+        if not stock:
+            return {"ok": False, "msg": "无效的股票代码"}
+        if qty <= 0:
+            return {"ok": False, "msg": "购买数量需大于0"}
+
+        prices, _ = self.get_stock_prices()
+        current_price = prices[stock_id]["price"]
+        total_cost = current_price * qty
+
+        detail = await self.get_user_detail(user_id)
+        if detail["bal"] < total_cost:
+            return {"ok": False, "msg": f"余额不足，购买 {qty} 股 {stock['name']} 需要 {total_cost} PC"}
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (total_cost, user_id))
+                    await cur.execute("""
+                        INSERT INTO stock_holdings (user_id, stock_id, quantity)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE quantity=quantity+%s
+                    """, (user_id, stock_id, qty, qty))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -total_cost, f"股票买入: {stock['name']} x{qty}"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] -= total_cost
+            holdings = data.setdefault("stock_holdings", {})
+            key = f"{user_id}_{stock_id}"
+            holdings[key] = holdings.get(key, 0) + qty
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -total_cost, "description": f"股票买入: {stock['name']} x{qty}"
+            })
+            self._write_local(data)
+
+        return {"ok": True, "msg": f"买入成功！以单价 {current_price} PC 买入 {qty} 股 {stock['name']}，共消费 {total_cost} PC"}
 
     async def sell_stock(self, user_id, stock_id, qty):
-        return {"ok": False, "msg": "本地暂不支持该功能"}
+        from .const import STOCK_LIST
+        stock = next((s for s in STOCK_LIST if s["id"] == stock_id), None)
+        if not stock:
+            return {"ok": False, "msg": "无效的股票代码"}
+        if qty <= 0:
+            return {"ok": False, "msg": "卖出数量需大于0"}
+
+        holdings = await self.get_holdings(user_id)
+        owned_qty = next((h[1] for h in holdings if h[0] == stock_id), 0)
+        if owned_qty < qty:
+            return {"ok": False, "msg": f"你持有的 {stock['name']} 股票不足 {qty} 股 (当前仅持有 {owned_qty} 股)"}
+
+        prices, _ = self.get_stock_prices()
+        current_price = prices[stock_id]["price"]
+        total_payout = current_price * qty
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (total_payout, user_id))
+                    await cur.execute("UPDATE stock_holdings SET quantity=quantity-%s WHERE user_id=%s AND stock_id=%s", (qty, user_id, stock_id))
+                    await cur.execute("DELETE FROM stock_holdings WHERE user_id=%s AND quantity<=0", (user_id,))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, total_payout, f"股票卖出: {stock['name']} x{qty}"))
+        else:
+            data = self._read_local()
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] += total_payout
+            holdings_dict = data.setdefault("stock_holdings", {})
+            key = f"{user_id}_{stock_id}"
+            holdings_dict[key] = holdings_dict.get(key, 0) - qty
+            if holdings_dict[key] <= 0:
+                del holdings_dict[key]
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": total_payout, "description": f"股票卖出: {stock['name']} x{qty}"
+            })
+            self._write_local(data)
+
+        return {"ok": True, "msg": f"卖出成功！以单价 {current_price} PC 卖出 {qty} 股 {stock['name']}，获得资金 {total_payout} PC"}
 
     async def get_holdings(self, user_id):
-        return []
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT stock_id, quantity FROM stock_holdings WHERE user_id=%s", (user_id,))
+                    return await cur.fetchall()
+        else:
+            data = self._read_local()
+            res = []
+            for key, qty in data.setdefault("stock_holdings", {}).items():
+                parts = key.split("_")
+                if len(parts) == 2 and int(parts[0]) == user_id:
+                    res.append((parts[1], qty))
+            return res
 
     async def create_auction(self, user_id, item_id, price, hours):
-        return "本地暂不支持该功能"
+        from .const import SHOP_ITEMS
+        item = next((i for i in SHOP_ITEMS if i["id"] == item_id), None)
+        if not item:
+            return "无效的道具ID"
+        if price <= 0:
+            return "底价必须大于0"
+        if hours < 1 or hours > 72:
+            return "上架时间必须在1-72小时之间"
+
+        inv = await self.get_inventory(user_id)
+        owned_item = next((i for i in inv if i["id"] == item_id and i["qty"] > 0), None)
+        if not owned_item:
+            return f"你的背包中没有道具「{item['name']}」"
+
+        import time
+        end_time_ts = time.time() + hours * 3600
+        end_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time_ts))
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE user_inventory SET quantity=quantity-1 WHERE user_id=%s AND item_id=%s", (user_id, item_id))
+                    await cur.execute("DELETE FROM user_inventory WHERE user_id=%s AND quantity<=0", (user_id,))
+                    await cur.execute("INSERT INTO auction_listings (seller_id, item_id, min_price, current_price, end_time, status) VALUES (%s, %s, %s, %s, %s, 'active')", (user_id, item_id, price, price, end_time_str))
+        else:
+            data = self._read_local()
+            u_key = f"{user_id}_{item_id}"
+            inv_dict = data.setdefault("user_inventory", {})
+            inv_dict[u_key] = inv_dict.get(u_key, 0) - 1
+            if inv_dict[u_key] <= 0:
+                del inv_dict[u_key]
+            listings = data.setdefault("auction_listings", [])
+            new_id = max([l["id"] for l in listings], default=0) + 1
+            listings.append({
+                "id": new_id,
+                "seller_id": user_id,
+                "item_id": item_id,
+                "min_price": price,
+                "current_price": price,
+                "current_bidder": None,
+                "end_time": end_time_str,
+                "status": "active"
+            })
+            self._write_local(data)
+
+        return f"成功上架「{item['name']}」至拍卖行！底价: {price} PC，持续 {hours} 小时。"
 
     async def bid_auction(self, user_id, auction_id, amount):
-        return "本地暂不支持该功能"
+        detail = await self.get_user_detail(user_id)
+        if detail["bal"] < amount:
+            return "出价金额超过了你拥有的余额"
+
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT seller_id, item_id, current_price, end_time, status, current_bidder FROM auction_listings WHERE id=%s FOR UPDATE", (auction_id,))
+                    row = await cur.fetchone()
+                    if not row or row[4] != "active":
+                        return "拍卖品不存在或已结束"
+                    if user_id == row[0]:
+                        return "你不能竞拍自己上架的物品"
+                    if amount <= row[2]:
+                        return f"竞拍出价必须高于当前价格 {row[2]} PC"
+                    
+                    # Refund previous bidder
+                    prev_bidder = row[5]
+                    if prev_bidder:
+                        await cur.execute("UPDATE user_economy SET balance=balance+%s WHERE user_id=%s", (row[2], prev_bidder))
+                        await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (prev_bidder, row[2], f"拍卖被超退款 [ID:{auction_id}]"))
+                    
+                    await cur.execute("UPDATE user_economy SET balance=balance-%s WHERE user_id=%s", (amount, user_id))
+                    await cur.execute("UPDATE auction_listings SET current_price=%s, current_bidder=%s WHERE id=%s", (amount, user_id, auction_id))
+                    await cur.execute("INSERT INTO economy_logs (user_id, amount, description) VALUES (%s, %s, %s)", (user_id, -amount, f"参与拍卖竞价 [ID:{auction_id}]"))
+                    return f"竞价成功！当前出价为 {amount} PC"
+        else:
+            data = self._read_local()
+            listings = data.setdefault("auction_listings", [])
+            target = next((l for l in listings if l["id"] == auction_id and l["status"] == "active"), None)
+            if not target:
+                return "拍卖品不存在或已结束"
+            if user_id == target["seller_id"]:
+                return "你不能竞拍自己上架的物品"
+            if amount <= target["current_price"]:
+                return f"竞拍出价必须高于当前价格 {target['current_price']} PC"
+
+            prev_bidder = target["current_bidder"]
+            if prev_bidder:
+                pb_key = str(prev_bidder)
+                if pb_key in data["user_economy"]:
+                    data["user_economy"][pb_key]["balance"] += target["current_price"]
+                data.setdefault("economy_logs", []).append({
+                    "user_id": prev_bidder, "amount": target["current_price"], "description": f"拍卖被超退款 [ID:{auction_id}]"
+                })
+
+            uid_str = str(user_id)
+            data["user_economy"][uid_str]["balance"] -= amount
+            target["current_price"] = amount
+            target["current_bidder"] = user_id
+            data.setdefault("economy_logs", []).append({
+                "user_id": user_id, "amount": -amount, "description": f"参与拍卖竞价 [ID:{auction_id}]"
+            })
+            self._write_local(data)
+            return f"竞价成功！当前出价为 {amount} PC"
 
     async def write_diary(self, user_id, content, is_anonymous=0):
-        return "本地暂不支持该功能"
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT INTO economy_diaries (user_id, content, is_anonymous) VALUES (%s, %s, %s)", (user_id, content, is_anonymous))
+                    return "日记发布成功"
+        else:
+            data = self._read_local()
+            diaries = data.setdefault("economy_diaries", [])
+            new_id = max([d["id"] for d in diaries], default=0) + 1
+            diaries.append({
+                "id": new_id,
+                "user_id": user_id,
+                "content": content,
+                "likes": 0,
+                "is_anonymous": is_anonymous,
+                "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            self._write_local(data)
+            return "日记发布成功"
 
     async def like_diary(self, user_id, diary_id):
-        return "本地暂不支持该功能"
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT COUNT(*) FROM diary_likes WHERE diary_id=%s AND user_id=%s", (diary_id, user_id))
+                    if (await cur.fetchone())[0] > 0:
+                        return "你已经为该日记产生共鸣过了"
+                    await cur.execute("INSERT INTO diary_likes (diary_id, user_id) VALUES (%s, %s)", (diary_id, user_id))
+                    await cur.execute("UPDATE economy_diaries SET likes=likes+1 WHERE id=%s", (diary_id,))
+                    return "共鸣成功"
+        else:
+            data = self._read_local()
+            likes = data.setdefault("diary_likes", {})
+            key = f"{diary_id}_{user_id}"
+            if key in likes:
+                return "你已经为该日记产生共鸣过了"
+            likes[key] = True
+            diaries = data.setdefault("economy_diaries", [])
+            target = next((d for d in diaries if d["id"] == diary_id), None)
+            if target:
+                target["likes"] += 1
+            self._write_local(data)
+            return "共鸣成功"
 
     async def get_diaries(self, limit=10):
-        return []
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, user_id, content, likes, is_anonymous FROM economy_diaries ORDER BY id DESC LIMIT %s", (limit,))
+                    rows = await cur.fetchall()
+                    return [{"id": r[0], "user_id": r[1], "content": r[2], "likes": r[3], "is_anonymous": r[4]} for r in rows]
+        else:
+            data = self._read_local()
+            diaries = data.setdefault("economy_diaries", [])
+            sorted_diaries = sorted(diaries, key=lambda x: x["id"], reverse=True)[:limit]
+            return sorted_diaries

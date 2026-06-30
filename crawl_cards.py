@@ -5,6 +5,11 @@ import re
 import time
 import requests
 from pathlib import Path
+try:
+    from nonebot.log import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger("Mizuki-Econmy")
 
 DATA_DIR = Path(__file__).parent.parent.parent.parent / "data" / "mizuki_econmy"
 SAVE_DIR = DATA_DIR / "cards"
@@ -56,21 +61,22 @@ def download(url, save_path, proxies=None):
         pass
     return False
 
+def download_url_with_fallback(direct_url, proxy_url, save_path, proxies):
+    if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
+        return "exists"
+    if proxies:
+        if download(direct_url, save_path, proxies):
+            return "local-proxy"
+    if download(direct_url, save_path):
+        return "direct"
+    if download(proxy_url, save_path):
+        return "remote-proxy"
+    return "failed"
+
 def download_with_fallback(asset_name, save_path, char_name, proxies):
     sekai_url = f"{SEKAI_BEST_BASE}/{asset_name}"
     proxy_url = f"{REMOTE_PROXY_BASE}/api-assets/sekai-jp-assets/character/member/{asset_name}"
-
-    if proxies:
-        if download(sekai_url, save_path, proxies):
-            return "local-proxy"
-
-    if download(sekai_url, save_path):
-        return "direct"
-
-    if download(proxy_url, save_path):
-        return "remote-proxy"
-
-    return "failed"
+    return download_url_with_fallback(sekai_url, proxy_url, save_path, proxies)
 
 def fetch_latest_cards():
     proxies = get_proxies()
@@ -113,26 +119,43 @@ def find_new_cards(old_cards, new_cards):
     return added_ids, removed_ids
 
 def main():
+    logger.info("PJSK卡牌抓取器: 开始检查并更新卡牌元数据与缩略图...")
     force = "--force" in sys.argv
     no_download = "--no-download" in sys.argv
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Clean loose unclassified webp files in SAVE_DIR root
+    cleaned_loose = 0
+    for f in SAVE_DIR.glob("*.webp"):
+        try:
+            f.unlink()
+            cleaned_loose += 1
+        except:
+            pass
+    if cleaned_loose > 0:
+        logger.info(f"PJSK卡牌抓取器: 已成功从卡牌根目录清理 {cleaned_loose} 个散落图片文件。")
+
     new_cards = fetch_latest_cards()
     if not new_cards:
+        logger.error("PJSK卡牌抓取器: 无法拉取最新的卡牌元数据。")
         return
     old_cards = load_local_cards()
     added_ids, removed_ids = find_new_cards(old_cards, new_cards)
     if not added_ids and not force:
+        logger.info("PJSK卡牌抓取器: 未检测到任何新增卡牌，本地缓存已是最新状态。")
         with open(CARDS_JSON, "w", encoding="utf-8") as f:
             json.dump(new_cards, f, ensure_ascii=False, indent=2)
         return
+    
     new_card_list = [c for c in new_cards if c.get("id") in added_ids]
     if no_download:
-        pass
+        logger.info(f"PJSK卡牌抓取器: 仅更新元数据，共新增 {len(new_card_list)} 个卡牌配置项。")
     else:
         proxies = get_proxies()
         success = 0
         failed = 0
         download_list = new_card_list if not force else new_cards
+        logger.info(f"PJSK卡牌抓取器: 检测到新增/需要处理的卡牌共 {len(download_list)} 张，开始下载其卡面与缩略图...")
         for i, card in enumerate(download_list):
             char_id = card.get("characterId", 0)
             char_name = CHAR_MAP.get(char_id, "其他")
@@ -144,21 +167,45 @@ def main():
             safe_name = sanitize(f"[{rarity}][{prefix}]_{char_name}")
             target_dir = SAVE_DIR / char_name
             target_dir.mkdir(exist_ok=True)
+            
+            # Card image normal
             path_normal = target_dir / f"{safe_name}_特训前.webp"
             if not path_normal.exists() or force:
+                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训前大图...")
                 result = download_with_fallback(f"{asset_name}/card_normal.webp", str(path_normal), char_name, proxies)
-                if result != "failed":
+                if result != "failed" and result != "exists":
                     success += 1
-                else:
+                elif result == "failed":
                     failed += 1
+            
+            # Card thumbnail normal
+            path_normal_thumb = target_dir / f"{safe_name}_特训前_thumb.webp"
+            if not path_normal_thumb.exists() or force:
+                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训前缩略图...")
+                direct_t_url = f"https://storage.sekai.best/sekai-jp-assets/thumbnail/chara/{asset_name}_normal.webp"
+                proxy_t_url = f"{REMOTE_PROXY_BASE}/api-assets/sekai-jp-assets/thumbnail/chara/{asset_name}_normal.webp"
+                download_url_with_fallback(direct_t_url, proxy_t_url, str(path_normal_thumb), proxies)
+
             if card.get("cardRarityType") not in ["rarity_1", "rarity_2"]:
+                # Card image trained
                 path_trained = target_dir / f"{safe_name}_特训后.webp"
                 if not path_trained.exists() or force:
+                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训后大图...")
                     result = download_with_fallback(f"{asset_name}/card_after_training.webp", str(path_trained), char_name, proxies)
-                    if result != "failed":
+                    if result != "failed" and result != "exists":
                         success += 1
-                    else:
+                    elif result == "failed":
                         failed += 1
+                
+                # Card thumbnail trained
+                path_trained_thumb = target_dir / f"{safe_name}_特训后_thumb.webp"
+                if not path_trained_thumb.exists() or force:
+                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训后缩略图...")
+                    direct_t_url = f"https://storage.sekai.best/sekai-jp-assets/thumbnail/chara/{asset_name}_after_training.webp"
+                    proxy_t_url = f"{REMOTE_PROXY_BASE}/api-assets/sekai-jp-assets/thumbnail/chara/{asset_name}_after_training.webp"
+                    download_url_with_fallback(direct_t_url, proxy_t_url, str(path_trained_thumb), proxies)
+        logger.info(f"PJSK卡牌抓取器: 卡牌抓取处理完成，成功下载并更新了 {success} 个大图，失败数: {failed}。")
+
     with open(CARDS_JSON, "w", encoding="utf-8") as f:
         json.dump(new_cards, f, ensure_ascii=False, indent=2)
     with open(DIFF_LOG, "a", encoding="utf-8") as f:

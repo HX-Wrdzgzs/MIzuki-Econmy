@@ -5,7 +5,7 @@ import time
 import datetime
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from .const import SHOP_ITEMS, PJSK_LOCAL_PROXY, PJSK_PROXY_URL, PJSK_SEKAI_BEST_BASE
+from .const import SHOP_ITEMS, PJSK_LOCAL_PROXY, PJSK_PROXY_URL, PJSK_SEKAI_BEST_BASE, RARITY_MAP
 
 C_BG = (255, 240, 245)
 C_SURFACE = (255, 255, 255)
@@ -52,10 +52,10 @@ def wrap_text(text, font, max_width, draw):
     lines.append(current_line)
     return lines
 
-async def get_avatar(user_id, name="User"):
+async def get_avatar(user_id, name="User", bot=None, group_id=None):
     from pathlib import Path
     import time
-    cache_dir = Path("data/mizuki_econmy/avatars")
+    cache_dir = Path(__file__).parent.parent.parent.parent / "data" / "mizuki_econmy" / "avatars"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{user_id}.png"
     if cache_path.exists() and (time.time() - cache_path.stat().st_mtime < 86400):
@@ -63,10 +63,21 @@ async def get_avatar(user_id, name="User"):
             return Image.open(cache_path).convert("RGBA")
         except:
             pass
-    url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640&t={int(time.time())}"
+    avatar_url = None
+    if bot:
+        try:
+            params = {"user_id": int(user_id)}
+            if group_id:
+                params["group_id"] = str(group_id)
+            result = await bot.call_api("get_avatar", **params)
+            avatar_url = result.get("message")
+        except:
+            pass
+    if not avatar_url:
+        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640&t={int(time.time())}"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=3)
+            resp = await client.get(avatar_url, timeout=5)
             if resp.status_code == 200:
                 img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
                 img = img.resize((150, 150))
@@ -94,7 +105,7 @@ def draw_dot(draw, x, y, color):
     r = 8
     draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
-async def draw_sign_card(user_id, user_name, data):
+async def draw_sign_card(user_id, user_name, data, bot=None, group_id=None):
     W = 800
     dummy_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     f_title = load_font(40)
@@ -125,7 +136,7 @@ async def draw_sign_card(user_id, user_name, data):
     img = Image.new("RGBA", (W, H), C_BG)
     draw = ImageDraw.Draw(img)
     draw.rectangle([0, 0, W, 120], fill=C_PINK_MAIN)
-    avatar = await get_avatar(user_id, user_name)
+    avatar = await get_avatar(user_id, user_name, bot, group_id)
     img.paste(avatar, (325, 80), avatar)
     draw.ellipse([325, 80, 475, 230], outline="white", width=5)
     title_txt = f"<{data['title']}>"
@@ -481,7 +492,7 @@ RANK_COLORS = {1: (255, 215, 0), 2: (192, 192, 192), 3: (205, 127, 50)}
 async def draw_leaderboard_card(user_name: str, entries: list, my_rank: int = 0) -> bytes:
     W = 800
     show = entries[:20]
-    row_h = 80
+    row_h = 110
     header_h = 250
     H = header_h + len(show) * row_h + 100
     img = Image.new("RGBA", (W, H), C_BG)
@@ -501,23 +512,23 @@ async def draw_leaderboard_card(user_name: str, entries: list, my_rank: int = 0)
             rank_color = RANK_COLORS[rank]
         draw.rounded_rectangle([40, curr_y, W - 40, curr_y + row_h - 10], radius=15, fill=bg, outline=C_BORDER, width=2)
         rank_label = f"#{rank}"
-        draw.text((60, curr_y + 18), rank_label, font=f_rank, fill=rank_color)
+        draw.text((60, curr_y + 30), rank_label, font=f_rank, fill=rank_color)
         name_txt = e.get("name", "???")
         if len(name_txt) > 8:
             name_txt = name_txt[:7] + "..."
-        draw.text((170, curr_y + 12), name_txt, font=f_name, fill=C_TEXT_MAIN)
+        draw.text((170, curr_y + 20), name_txt, font=f_name, fill=C_TEXT_MAIN)
         title = e.get("title", "")
         if title:
             t_txt = f"<{title}>"
             if len(t_txt) > 10:
                 t_txt = t_txt[:9] + ">"
-            draw.text((170, curr_y + 46), t_txt, font=f_info, fill=C_TEXT_SUB)
+            draw.text((170, curr_y + 60), t_txt, font=f_info, fill=C_TEXT_SUB)
         bal_txt = f"{e.get('score', 0)} PC"
         w_bal = draw.textlength(bal_txt, font=f_rank)
-        draw.text((W - 60 - w_bal, curr_y + 15), bal_txt, font=f_rank, fill=C_PINK_DARK)
+        draw.text((W - 60 - w_bal, curr_y + 22), bal_txt, font=f_rank, fill=C_PINK_DARK)
         lvl_txt = f"Lv.{e.get('level', 1)}"
         w_lvl = draw.textlength(lvl_txt, font=f_small)
-        draw.text((W - 60 - w_lvl, curr_y + 48), lvl_txt, font=f_small, fill=C_TEXT_SUB)
+        draw.text((W - 60 - w_lvl, curr_y + 62), lvl_txt, font=f_small, fill=C_TEXT_SUB)
         curr_y += row_h
     if my_rank > 0:
         my_txt = f"你的排名: #{my_rank}"
@@ -651,6 +662,206 @@ async def draw_calendar_card(user_id: int, user_name: str, sign_dates: set, stre
     url_txt = "Mizuki Economy | list.mizuki.top"
     w_url = draw.textlength(url_txt, font=load_font(20))
     draw.text(((W - w_url) / 2, H - 40), url_txt, font=load_font(20), fill=C_TEXT_SUB)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+async def draw_stock_chart(stock_list: list, prices: dict, history: dict, event_desc: str = "") -> bytes:
+    W = 1000
+    row_h = 130
+    header_h = 240
+    if event_desc:
+        header_h += 80
+    H = header_h + len(stock_list) * row_h + 100
+    img = Image.new("RGBA", (W, H), C_BG)
+    draw = ImageDraw.Draw(img)
+    
+    # Draw header background
+    draw.rectangle([0, 0, W, 180], fill=C_PINK_MAIN)
+    draw.text((60, 50), "25时证券交易所", font=load_font(60), fill="white")
+    
+    # Event box
+    curr_y = 190
+    if event_desc:
+        draw.rounded_rectangle([40, curr_y, W - 40, curr_y + 60], radius=10, fill=(255, 235, 235), outline=C_RED, width=2)
+        draw.text((60, curr_y + 16), event_desc, font=load_font(24), fill=C_RED)
+        curr_y += 80
+        
+    f_title = load_font(32)
+    f_price = load_font(38)
+    f_change = load_font(26)
+    f_small = load_font(20)
+    
+    for idx, s in enumerate(stock_list):
+        sid = s["id"]
+        s_price = prices[sid]["price"]
+        s_change = prices[sid]["change"]
+        
+        # Determine change color
+        if s_change > 0:
+            change_txt = f"+{s_change}%"
+            change_color = C_RED
+        elif s_change < 0:
+            change_txt = f"{s_change}%"
+            change_color = C_GREEN
+        else:
+            change_txt = "0%"
+            change_color = C_TEXT_SUB
+            
+        draw.rounded_rectangle([40, curr_y, W - 40, curr_y + row_h - 15], radius=15, fill="white", outline=C_BORDER, width=2)
+        
+        # Stock Info
+        draw.text((70, curr_y + 20), f"[{sid}] {s['name']}", font=f_title, fill=C_TEXT_MAIN)
+        draw.text((70, curr_y + 65), f"基准价: {s['base_price']} PC", font=f_small, fill=C_TEXT_SUB)
+        
+        # Current Price & Change
+        draw.text((440, curr_y + 18), f"{s_price} PC", font=f_price, fill=change_color)
+        draw.text((440, curr_y + 65), change_txt, font=f_change, fill=change_color)
+        
+        # Line Sparkline Chart
+        stock_hist = history.get(sid, [])
+        if len(stock_hist) >= 2:
+            hist_prices = [p[1] for p in stock_hist]
+            min_p = min(hist_prices)
+            max_p = max(hist_prices)
+            p_range = max_p - min_p if max_p != min_p else 1.0
+            
+            graph_x = 650
+            graph_w = 280
+            graph_y = curr_y + 15
+            graph_h = 75
+            
+            points = []
+            for i, (date_str, val) in enumerate(stock_hist):
+                px = graph_x + i * (graph_w / (len(stock_hist) - 1))
+                py = (graph_y + graph_h) - ((val - min_p) / p_range) * (graph_h - 10)
+                points.append((px, py))
+                
+            # Draw line segments
+            for i in range(len(points) - 1):
+                draw.line([points[i], points[i+1]], fill=change_color, width=3)
+                
+            # Draw points and labels
+            for i, (px, py) in enumerate(points):
+                r = 4
+                draw.ellipse([px - r, py - r, px + r, py + r], fill=change_color)
+                # Label first and last dates
+                if i == 0 or i == len(points) - 1:
+                    d_txt = stock_hist[i][0]
+                    dw = draw.textlength(d_txt, font=f_small)
+                    draw.text((px - dw / 2, graph_y + graph_h + 3), d_txt, font=f_small, fill=C_TEXT_SUB)
+                    
+        curr_y += row_h
+        
+    footer = "股市有风险，入市需谨慎 | 买入 股票代码 数量"
+    fw = draw.textlength(footer, font=load_font(24))
+    draw.text(((W - fw) / 2, H - 45), footer, font=load_font(24), fill=C_TEXT_SUB)
+    
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+async def draw_card_collection(user_name: str, cards_with_info: list) -> bytes:
+    # Sort cards by star reverse (highest star first)
+    cards_with_info = sorted(cards_with_info, key=lambda x: x["info"].get("star", 0), reverse=True)
+    
+    W = 1000
+    col_w = 175
+    row_h = 240
+    cols = 5
+    rows = math.ceil(len(cards_with_info) / cols) if cards_with_info else 1
+    
+    header_h = 240
+    H = header_h + rows * row_h + 100
+    img = Image.new("RGBA", (W, H), C_BG)
+    draw = ImageDraw.Draw(img)
+    
+    # Draw header
+    draw.rectangle([0, 0, W, 180], fill=C_PINK_MAIN)
+    draw.text((60, 50), f"{user_name} 的卡牌馆藏", font=load_font(50), fill="white")
+    
+    total_cards = sum(c["qty"] for c in cards_with_info)
+    unique_cards = len(cards_with_info)
+    draw.text((60, 130), f"共收集了 {unique_cards} 种，共 {total_cards} 张卡牌", font=load_font(28), fill="white")
+    
+    f_name = load_font(24)
+    f_star = load_font(22)
+    f_qty = load_font(20)
+    
+    grid_x_start = (W - cols * col_w) // 2
+    curr_y = header_h
+    
+    for idx, item in enumerate(cards_with_info):
+        col = idx % cols
+        row = idx // cols
+        x = grid_x_start + col * col_w
+        y = curr_y + row * row_h
+        
+        info = item["info"]
+        qty = item["qty"]
+        star = info.get("star", 1)
+        char_name = info.get("char_name", "其他")
+        prefix = info.get("prefix", "card")
+        asset_name = info.get("assetbundleName", "")
+        
+        # Load thumbnail
+        from pathlib import Path
+        import re
+        def sanitize(name):
+            return re.sub(r'[\\/*?:"<>|]', "", str(name))
+            
+        rarity_val = RARITY_MAP.get(info.get("cardRarityType"), {})
+        rarity_str = rarity_val.get("label", "?") if isinstance(rarity_val, dict) else rarity_val
+        safe_name = sanitize(f"[{rarity_str}][{prefix}]_{char_name}")
+        
+        # Try to find the thumbnail image (try normal first, then trained)
+        cards_dir = Path(__file__).parent.parent.parent.parent / "data" / "mizuki_econmy" / "cards"
+        thumb_path = cards_dir / char_name / f"{safe_name}_特训前_thumb.webp"
+        if not thumb_path.exists() and star >= 3:
+            thumb_path = cards_dir / char_name / f"{safe_name}_特训后_thumb.webp"
+            
+        border_color = STAR_BORDER.get(star, (150, 150, 150))
+        
+        # Draw card container
+        draw.rounded_rectangle([x + 5, y + 5, x + col_w - 5, y + row_h - 10], radius=15, fill="white", outline=C_BORDER, width=2)
+        
+        # Draw thumbnail image if found
+        thumb_drawn = False
+        if thumb_path.exists():
+            try:
+                t_img = Image.open(thumb_path).convert("RGBA").resize((130, 130), Image.LANCZOS)
+                img.paste(t_img, (x + 22, y + 15), t_img)
+                draw.rectangle([x + 22, y + 15, x + 152, y + 145], outline=border_color, width=3)
+                thumb_drawn = True
+            except:
+                pass
+                
+        if not thumb_drawn:
+            # Fallback placeholder block
+            draw.rounded_rectangle([x + 22, y + 15, x + 152, y + 145], radius=10, fill=border_color)
+            fallback_txt = prefix[:8]
+            fw = draw.textlength(fallback_txt, font=f_qty)
+            draw.text((x + 87 - fw / 2, y + 70), fallback_txt, font=f_qty, fill="white")
+            
+        # Draw quantity tag
+        qty_txt = f"x{qty}"
+        qw = draw.textlength(qty_txt, font=f_qty)
+        draw.rounded_rectangle([x + 115 - qw, y + 20, x + 145, y + 50], radius=8, fill=C_PINK_DARK)
+        draw.text((x + 130 - qw, y + 23), qty_txt, font=f_qty, fill="white")
+        
+        # Draw name & star
+        name_txt = char_name[:6]
+        nw = draw.textlength(name_txt, font=f_name)
+        draw.text((x + col_w / 2 - nw / 2, y + 155), name_txt, font=f_name, fill=C_TEXT_MAIN)
+        
+        star_txt = "★" * star
+        sw = draw.textlength(star_txt, font=f_star)
+        draw.text((x + col_w / 2 - sw / 2, y + 185), star_txt, font=f_star, fill=(255, 180, 0))
+        
+    footer = "Mizuki Economy | list.mizuki.top"
+    fw = draw.textlength(footer, font=load_font(24))
+    draw.text(((W - fw) / 2, H - 45), footer, font=load_font(24), fill=C_TEXT_SUB)
+    
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()
