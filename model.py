@@ -1817,39 +1817,45 @@ class EconomyManager:
             event_seed = day_seed * 37
             
             random.seed(event_seed)
-            has_event = random.random() < 0.1
-            event_stock_id = None
-            event_multiplier = 1.0
-            day_event_desc = ""
-            
+            # Merton Jump Diffusion (MJD) event setup
+            jump_pct = 0.0
             if has_event:
                 event_stock = random.choice(STOCK_LIST)
                 event_stock_id = event_stock["id"]
                 is_surge = random.random() < 0.5
                 if is_surge:
-                    event_multiplier = 1.5 + random.uniform(0.1, 0.3)
-                    day_event_desc = f"【交易所简报】{event_stock['name']} 联动新曲大受好评，股价疯狂暴涨！"
+                    jump_pct = 0.15 + random.uniform(0.05, 0.15)
+                    day_event_desc = f"【交易所简报】{event_stock['name']} 联动新曲大受好评，股价大步跃升！"
                 else:
-                    event_multiplier = 0.35 + random.uniform(0.0, 0.1)
-                    day_event_desc = f"【交易所简报】{event_stock['name']} 宣布物料延期交付，股价跌跌不休！"
+                    jump_pct = -0.15 - random.uniform(0.05, 0.15)
+                    day_event_desc = f"【交易所简报】{event_stock['name']} 宣布物料延期交付，股价遭遇跳空低开！"
             
             if ord_val == today_ordinal:
                 event_desc = day_event_desc
                 
+            # Autoregressive momentum for fBM long-range memory correlation (H > 0.5)
+            # We initialize it deterministic for the simulation sequence
+            if ord_val == start_date.toordinal():
+                prev_returns = {s["id"]: 0.0 for s in STOCK_LIST}
+            phi = 0.35
+
             for s in STOCK_LIST:
                 sid = s["id"]
                 random.seed(day_seed + hash(sid))
-                change_pct = random.uniform(-0.08, 0.09)
+                shock = random.uniform(-0.08, 0.09)
+                
+                # fBM returns autocorrelation coupling
+                change_pct = phi * prev_returns.get(sid, 0.0) + (1.0 - phi) * shock
+                
+                # Merton Jump Diffusion coupling
                 if sid == event_stock_id:
-                    if event_multiplier > 1.0:
-                        change_pct = max(change_pct, 0.05) * event_multiplier
-                    else:
-                        change_pct = min(change_pct, -0.05) * (1.0 - event_multiplier)
+                    change_pct += jump_pct
                 
                 prev_price = prices_at_date[sid]
                 new_price = int(prev_price * (1.0 + change_pct))
                 new_price = max(10, new_price)
                 prices_at_date[sid] = new_price
+                prev_returns[sid] = change_pct
                 
                 if ord_val in history_days_ord:
                     date_str = date_val.strftime("%m-%d")
