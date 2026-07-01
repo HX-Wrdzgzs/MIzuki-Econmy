@@ -119,6 +119,12 @@ def find_new_cards(old_cards, new_cards):
     return added_ids, removed_ids
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except:
+        pass
+
     logger.info("PJSK卡牌抓取器: 开始检查并更新卡牌元数据与缩略图...")
     force = "--force" in sys.argv
     no_download = "--no-download" in sys.argv
@@ -171,7 +177,7 @@ def main():
             # Card image normal
             path_normal = target_dir / f"{safe_name}_特训前.webp"
             if not path_normal.exists() or force:
-                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训前大图...")
+                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} (ID: {card.get('id')}) 的特训前大图...")
                 result = download_with_fallback(f"{asset_name}/card_normal.webp", str(path_normal), char_name, proxies)
                 if result != "failed" and result != "exists":
                     success += 1
@@ -181,7 +187,7 @@ def main():
             # Card thumbnail normal
             path_normal_thumb = target_dir / f"{safe_name}_特训前_thumb.webp"
             if not path_normal_thumb.exists() or force:
-                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训前缩略图...")
+                logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} (ID: {card.get('id')}) 的特训前缩略图...")
                 direct_t_url = f"https://storage.sekai.best/sekai-jp-assets/thumbnail/chara/{asset_name}_normal.webp"
                 proxy_t_url = f"{REMOTE_PROXY_BASE}/api-assets/sekai-jp-assets/thumbnail/chara/{asset_name}_normal.webp"
                 download_url_with_fallback(direct_t_url, proxy_t_url, str(path_normal_thumb), proxies)
@@ -190,7 +196,7 @@ def main():
                 # Card image trained
                 path_trained = target_dir / f"{safe_name}_特训后.webp"
                 if not path_trained.exists() or force:
-                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训后大图...")
+                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} (ID: {card.get('id')}) 的特训后大图...")
                     result = download_with_fallback(f"{asset_name}/card_after_training.webp", str(path_trained), char_name, proxies)
                     if result != "failed" and result != "exists":
                         success += 1
@@ -200,7 +206,7 @@ def main():
                 # Card thumbnail trained
                 path_trained_thumb = target_dir / f"{safe_name}_特训后_thumb.webp"
                 if not path_trained_thumb.exists() or force:
-                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} - {prefix} 的特训后缩略图...")
+                    logger.info(f"PJSK卡牌抓取器: [{i+1}/{len(download_list)}] 正在下载 {char_name} (ID: {card.get('id')}) 的特训后缩略图...")
                     direct_t_url = f"https://storage.sekai.best/sekai-jp-assets/thumbnail/chara/{asset_name}_after_training.webp"
                     proxy_t_url = f"{REMOTE_PROXY_BASE}/api-assets/sekai-jp-assets/thumbnail/chara/{asset_name}_after_training.webp"
                     download_url_with_fallback(direct_t_url, proxy_t_url, str(path_trained_thumb), proxies)
