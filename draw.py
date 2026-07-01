@@ -801,8 +801,8 @@ async def draw_card_collection(user_name: str, cards_with_info: list) -> bytes:
         qty = item["qty"]
         star = info.get("star", 1)
         char_name = info.get("char_name", "其他")
-        prefix = info.get("prefix", "card")
-        asset_name = info.get("assetbundleName", "")
+        prefix = info.get("prefix") or info.get("title") or "card"
+        asset_name = info.get("assetbundleName") or info.get("asset") or ""
         
         # Load thumbnail
         from pathlib import Path
@@ -810,7 +810,8 @@ async def draw_card_collection(user_name: str, cards_with_info: list) -> bytes:
         def sanitize(name):
             return re.sub(r'[\\/*?:"<>|]', "", str(name))
             
-        rarity_val = RARITY_MAP.get(info.get("cardRarityType"), {})
+        r_type = info.get("cardRarityType") or info.get("rarity")
+        rarity_val = RARITY_MAP.get(r_type, {})
         rarity_str = rarity_val.get("label", "?") if isinstance(rarity_val, dict) else rarity_val
         safe_name = sanitize(f"[{rarity_str}][{prefix}]_{char_name}")
         
